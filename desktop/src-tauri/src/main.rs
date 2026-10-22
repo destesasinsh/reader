@@ -123,10 +123,25 @@ fn main() {
     };
     context.config_mut().identifier = paths.instance_identifier.clone();
 
+    // 冷启动：系统通过 `legado://` 唤起时，URL 在命令行参数里。此时 webview 还没
+    // 建好，前端也还没挂载，所以只暂存，等前端就绪后自己来取。
+    if let Some(url) =
+        reader_rust::api::deep_link::find_deeplink(&std::env::args().collect::<Vec<_>>())
+    {
+        reader_rust::api::deep_link::set_pending(url);
+    }
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // 应用已经在运行时又被 `legado://` 唤起：URL 由第二个进程用启动参数带进来，
+            // 这里转交给已运行实例。先暂存，再发事件让前端立刻来取。
+            if let Some(url) = reader_rust::api::deep_link::find_deeplink(&args) {
+                reader_rust::api::deep_link::set_pending(url);
+                let _ = app.emit("legado-deeplink", ());
+            }
+
             // Surface the existing window instead of starting a second instance.
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();

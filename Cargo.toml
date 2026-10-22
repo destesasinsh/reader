@@ -46,6 +46,10 @@ rquickjs = { version = "0.7", features = ["futures"] }
 tower-http = { version = "0.5", features = ["trace", "cors", "request-id", "fs"] }
 http = "1"
 http-body-util = "0.1"
+# Edge 朗读（edge-tts）走 WebSocket：微软的非官方公共接口，必须用 rustls
+# 且不引 openssl（Windows 上 openssl 需要额外 DLL/编译链）。证书根与 reqwest
+# 的 rustls-tls 保持一致（webpki 内置根）。
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 urlencoding = "2"
 serde_urlencoded = "0.7"
 futures = "0.3"

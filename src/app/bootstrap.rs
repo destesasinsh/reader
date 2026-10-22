@@ -7,10 +7,11 @@ use crate::crawler::http_client::HttpClient;
 use crate::parser::rule_engine::RuleEngine;
 use crate::service::{
     book_group_service::BookGroupService, book_service::BookService,
-    book_source_service::BookSourceService, json_document_service::JsonDocumentService,
-    local_epub_book::LocalEpubBookService, local_pdf_book::LocalPdfBookService,
-    local_txt_book::LocalTxtBookService, reading_stats_service::ReadingStatsService,
-    update_service::UpdateService, user_service::UserService,
+    book_source_service::BookSourceService, http_tts_service::HttpTtsService,
+    json_document_service::JsonDocumentService, local_epub_book::LocalEpubBookService,
+    local_pdf_book::LocalPdfBookService, local_txt_book::LocalTxtBookService,
+    reading_stats_service::ReadingStatsService, update_service::UpdateService,
+    user_service::UserService,
 };
 use crate::storage::{cache::file_cache::FileCache, db, fs::storage_fs::StorageFs};
 
@@ -57,6 +58,7 @@ pub async fn build_state(cfg: &AppConfig) -> anyhow::Result<AppState> {
     let local_epub_book_service = Arc::new(LocalEpubBookService::new(&cfg.storage_dir));
     let local_pdf_book_service = Arc::new(LocalPdfBookService::new(&cfg.storage_dir));
     let json_document_service = Arc::new(JsonDocumentService::new(pool.clone(), &cfg.storage_dir));
+    let http_tts_service = Arc::new(HttpTtsService::new(json_document_service.clone()));
     let user_service = Arc::new(UserService::new(cfg.clone(), pool.clone()));
     user_service.migrate_legacy_users_from_json().await?;
     let book_group_service = Arc::new(BookGroupService::new(json_document_service.clone()));
@@ -104,5 +106,6 @@ pub async fn build_state(cfg: &AppConfig) -> anyhow::Result<AppState> {
         json_document_service,
         reading_stats_service,
         update_service,
+        http_tts_service,
     })
 }

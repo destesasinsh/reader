@@ -73,6 +73,34 @@ const version = readVersion()
 const productName = readProductName()
 console.log(`打包 阅读 桌面版 v${version}（productName: ${productName}）`)
 
+// 可选的「固定 WebView2 运行时」打包模式。
+//
+// 默认走 Tauri 的 downloadBootstrapper: 体积小, 但用户机器上的 WebView2 版本
+// 由系统更新决定 —— 新旧版本行为差异(渲染、媒体解码)只能靠运气。
+//
+// 设置 READER_FIXED_WEBVIEW2=<解压后的固定运行时目录> 后, 安装包会内嵌该版本
+// (约 +180MB), 所有用户都跑同一个内核, 版本漂移类问题从根上消失。它要求目录里
+// 有 msedgewebview2.exe 等运行时文件; 因为代价太大, 默认**不**开启, 只在需要
+// 排查"某台机器渲染不对"或发长期支持版时用。
+const fixedWebview2 = process.env.READER_FIXED_WEBVIEW2?.trim()
+let bundleConfig = {}
+if (fixedWebview2) {
+  const runtimePath = resolve(repoRoot, fixedWebview2)
+  if (!existsSync(join(runtimePath, 'msedgewebview2.exe'))) {
+    throw new Error(
+      `READER_FIXED_WEBVIEW2 指向的目录里没有 msedgewebview2.exe: ${runtimePath}\n` +
+      '请下载 WebView2 Fixed Version（.cab 解压后）再指向它。',
+    )
+  }
+  bundleConfig = {
+    windows: {
+      webviewInstallMode: { type: 'fixedRuntime', path: runtimePath },
+    },
+  }
+  console.log(`使用固定 WebView2 运行时: ${runtimePath}（安装包将增大约 180MB）`)
+}
+
+
 // `ci` rather than `install` so a release build can never drift the lockfile.
 runShell('npm ci', frontendDir)
 // Build the frontend here (beforeBuildCommand is a no-op) so the relative
@@ -82,7 +110,14 @@ runShell('npm run build', frontendDir)
 // `tauri build` runs cargo release build + NSIS bundling. CARGO_BUILD_JOBS=4
 // keeps the antivirus race at bay. Run from src-tauri/ so the relative
 // frontendDist path resolves correctly.
-run('node', [tauriCli, 'build'], tauriDir, { CARGO_BUILD_JOBS: '4' })
+//
+// --config 只在选择了固定 WebView2 运行时时传: 它会把这份内联配置与
+// tauri.windows.conf.json 深合并, 不传时行为与改动前完全一致。
+const buildArgs = [tauriCli, 'build']
+if (Object.keys(bundleConfig).length) {
+  buildArgs.push('--config', JSON.stringify({ bundle: bundleConfig }))
+}
+run('node', buildArgs, tauriDir, { CARGO_BUILD_JOBS: '4' })
 
 // ── NSIS installer ──
 // The workspace shares the repo-root target/ dir, so the bundle lands under

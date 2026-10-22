@@ -217,6 +217,34 @@ export interface ReplaceRule {
   order: number
 }
 
+// ─── 在线朗读引擎 (Legado httpTTS) ───
+/**
+ * 一条「在线朗读引擎」配置，字段与 Legado TTS 规则 JSON 对齐。
+ *
+ * `url` 里含由**后端**展开的模板（`{{java.encodeURI(java.encodeURI(speakText))}}`
+ * 等），前端只负责原样保存与挑选引擎，绝不解析模板 —— 求值要复用 rquickjs
+ * 沙盒，前端没有等价能力。
+ *
+ * 除 `id`/`name`/`url` 外全部可选：Legado 源站实际数据里大量条目缺字段，
+ * 反序列化必须宽容，缺了也不能整条丢弃。
+ */
+export interface HttpTts {
+  id: number
+  name: string
+  url: string
+  /** 引擎期望的响应 MIME。多数条目为空 —— 后端 IPC 返回的是裸字节，没有 HTTP
+   *  头，因此播放前必须靠魔数嗅探，这个字段只作兜底。
+   *  可选字段是 Rust `Option`，经 IPC 序列化后**可能是 null**而不是缺失。 */
+  contentType?: string | null
+  header?: string | null
+  concurrentRate?: string | null
+  enabledCookieJar?: boolean | null
+  loginUrl?: string | null
+  loginUi?: string | null
+  loginCheckJs?: string | null
+  lastUpdateTime?: number | string | null
+}
+
 // ─── RSS ───
 export interface RssSource {
   sourceUrl: string

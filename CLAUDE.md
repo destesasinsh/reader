@@ -69,6 +69,21 @@ reader-rust 是「阅读3.0」的 Rust 实现，主形态是 **Tauri v2 桌面�
 - **简繁转换用 legado 同款词表，别换回 OpenCC 预设**（`frontend/src/utils/chinese.js` + `legadoT2sDict.js`/`legadoS2tDict.js`，由 `scripts/build-legado-chinese-dicts.mjs` 从 quick-transfer-core 0.2.17 的 `tc/t2s.txt`、`tc/s2t.txt` 生成，t2s 侧合并了 legado `ChineseUtils.fixT2sDict()` 的排除表）。OpenCC 的 preset 与手机端**不是同一份词表**：`twp` 会把「序列」变「串行」（#12），`tw` 的 TSCharacters 把「乾」无条件映射成「干」，于是「乾國」→「干国」（#25）；而 legado 词表里「乾」没有单字映射，只在「乾燥/乾淨/乾杯」等短语里转换。两端显示不一致才是 bug，因此这里逐字照搬手机端词表（CJK 基本区 + GB2312 全表做过逐字比对）。`chineseMode` 有 `off`/`simplified`/`traditional` 三档，`off` 不加载那 ~1.2MB 词典分块。
 - **杀软并发编译竞态**：Windows 杀软实时扫描与 cargo 并行写 `.rlib` 冲突（随机 `invalid metadata files` / `link.exe 0xC000012D`）。**构建和测试务必用 `-j 4` 或更低并发**。建议给 `target/` 加 Defender 排除。
 - **不要在测试里构造 `server::assets::StaticSource`**：它带 `tauri::AppHandle`，链接器会把 tauri 的 `TaskDialogIndirect`（comctl32 v6）拉进测试 exe 的导入表；而 cargo 生成的测试 exe 没有应用 manifest，只加载得到 comctl32 v5，进程会在进 `main` 之前以 `STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139)` 退出 —— 输出里没有任何 Rust panic，看起来像"链接器坏了"。`assets.rs` 因此把路径判定抽成不碰 tauri 的 `resolve_lookup()` 纯函数来测。
+- **`ring` 的 C 编译会随机失败**：报 `cl.exe ... D8050: cannot execute c1.dll: failed to get command line into debug records`。同样是杀软竞态，但表现不同 —— 它发生在 `ring` 的 C 源码（`crypto/curve25519/curve25519.c`）编译阶段，重启一次通常就好。想让它稳定可复现，构建时加 `CARGO_PROFILE_DEV_DEBUG=0` 关掉调试信息（debug 构建不需要逐行调试依赖）。
+- **本机 `%TEMP%` 可能被组策略/沙箱挡住写入**：`std::env::temp_dir()` 下的 `create_dir_all` 会返回 `PermissionDenied (os error 5)`，于是所有用临时目录的测试（`app::window_state`、`export::epub`、`service::book_group_service`、`service::http_tts_service` 等约 48 个）集体失败。**这不是代码 bug**。绕开办法是把 `TEMP`/`TMP` 指到工作区内可写目录再跑测试：
+  ```powershell
+  $env:TEMP='D:\Dev\Reader\.cargo-tmp'; $env:TMP=$env:TEMP
+  New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
+  cargo test -p reader-rust --lib -j 2
+  ```
+- **启动隔离靠「按数据目录派生 identifier」**：`portable::resolve()` 为每个数据目录算一个 `instance_identifier`，`main.rs` 在建窗前把它写进 `context.config_mut().identifier`，并在 Windows 上把 WebView2 的 profile 显式指到 `<数据目录>/webview2`。单实例互斥体 `{identifier}-sim` 因此也跟着分开 —— 「开发版 + 安装版」以及「同一份程序拷两份」都能同时运行，不会再出现 `0x800700AA`（请求的资源在使用中）导致的"窗口永远不出现"。改这块时**不要**再按 debug/release 特判单实例：identifier 已按数据目录分开，无条件注册才是对的。
+- **净化规则的 `@js:` 脚本替换**：Legado 的 `replacement` 可以是以 `@js:` 开头的脚本（输入绑定 `result`，**取最后一个表达式语句的值**，等价 Rhino 的 `eval` 语义，脚本里通常没有 `return`）。桌面版在 `src/parser/replace_rule_js.rs` 的 rquickjs 沙盒里执行，**绝不要挪到前端** —— 渲染进程里跑第三方脚本等于把 DOM 与 `__TAURI_INTERNALS__` 交出去。前端只在**存在脚本规则**时才发一次 `apply_replace_rules`，纯正则/字面量规则仍走同步快路径（`displayContent` 先给同步结果，沙盒返回后自动替换）。
+- **Legado 正则要用 Unicode 的 `\w`**：`utils/replaceRuleRegex.ts` 会把 `\w` / `\W` 展开成显式 Unicode 字符类。这不是可选项：规则里 `[^\n\w…]{4,}`、`(?<=\n)\W+$` 这类写法按"`\w` 含汉字"写的，若沿用 JS 的 ASCII `\w`，**整段中文正文会被当成符号删掉**（实测 `#07 标点——`、`#15 净化词语` 会输出空正文）。`\b` 仍是 JS 的 ASCII 语义，属已知近似。
+- **在线朗读引擎的 URL 会带重复查询参数**：在线集合里 71/84 条引擎把 `voiceId` 写了两遍（基础地址自带占位音色，末尾再追加真实音色），而 dds 网关对重复参数直接回 `400 Bad Request`。`src/parser/http_tts_template.rs` 的 `normalize_url` 会在**字符串层面**去重（同名保留最后一个、位置沿用首次出现），不要换成 `Url::query_pairs_mut` 重建——那会解码再编码，把模板要求的 `text=%25E4...` 双重编码弄变形。
+- **`legado://` 一键导入**：书源站点的「一键导入」按钮是 `legado://import/<kind>?src=<url>`，只有注册了该协议的客户端会被系统唤起。协议由 **NSIS 安装器**在 `windows-hooks.nsh` 的 `NSIS_HOOK_POSTINSTALL` 里写入 `Software\Classes\legado`（卸载时按归属清理），所以**只有安装版**有；便携包解压即用、不经过安装器，拿不到协议归属。同一协议只能指向一个 exe，后安装的覆盖先安装的。
+  - 接收端：`main.rs` 冷启动时从 `std::env::args()` 取 URL 暂存，运行中被再次唤起则走 single-instance 回调（args 转发）并发 `legado-deeplink` 事件；前端 `App.vue` 取暂存后交给 `utils/legadoImport.ts` 分发到已有的导入通道（书源 / RSS / 净化规则 / 朗读引擎）。主题、排版等桌面版没有的实体只提示不支持。
+  - 运行中唤起在 debug 与 release 都可用：单实例插件是无条件注册的（identifier 已按数据目录分开，见上一条），第二个进程只会把参数转发给已运行实例。
+- **WebView2 版本漂移是唯一的真实运行时风险**：默认打包用 `downloadBootstrapper`（安装时按需下载/升级），用户内核版本由系统决定，渲染与媒体解码行为可能不一致。需要锁死内核时，用 `READER_FIXED_WEBVIEW2=<解压后的 Fixed Version 目录>` 跑 `npm run build`，`scripts/build-desktop.mjs` 会切到 `fixedRuntime`（安装包 +约 180MB）。默认不开启。
 - **`toml` 版本钉在 0.8.2**：共享 lockfile 因 `tauri -> gtk -> proc-macro-crate` 约束无法升级。无害（`config` 只用 Environment source，运行时从不解析 TOML）。不要尝试修复。
 - **`pdf-extract` 是 vendor 副本**（`vendor/pdf-extract`，经 `[patch.crates-io]` 接线），三处改动，都别退回上游行为：
   - **中文 CMap**：上游遇到无 ToUnicode 的 `GBK-EUC-H` 等 Type0 编码会 panic、嵌入式 GB CMap 的分段 `begincidrange` 解析失败。副本加了「恒等字节映射 + `encoding_rs` 逐码位解码伪 ToUnicode 表」的降级路径。

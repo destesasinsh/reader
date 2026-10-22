@@ -4,7 +4,8 @@
       <h3>内容净化规则</h3>
       <div class="header-actions">
         <button class="add-btn" @click="openEditModal()">+ 新增规则</button>
-        <button class="close-btn" @click="store.backPanel()">
+        <button class="add-btn" :disabled="importing" @click="openImportPanel()">导入</button>
+        <button class="close-btn" @click="handleClose">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="m15 18-6-6 6-6" />
           </svg>
@@ -29,6 +30,13 @@
           <div class="rule-name-row">
             <span class="rule-name">{{ rule.name }}</span>
             <span class="rule-badge" v-if="rule.isRegex">正则</span>
+            <!-- Legado 规则是 Java 正则, 少数写法在 JS 里没有等价物。标出来,
+                 免得用户以为「导入了却没效果」是阅读器的问题。 -->
+            <span
+              v-if="ruleIssues.get(rule.name)"
+              class="rule-badge warn"
+              :title="ruleIssues.get(rule.name)"
+            >无法执行</span>
           </div>
           <div class="rule-scope">{{ describeScope(rule.scope) }}</div>
           <div class="rule-pattern">匹配: {{ rule.pattern }}</div>
@@ -68,8 +76,12 @@
             <label>生效范围</label>
             <div class="scope-group">
               <button type="button" class="scope-btn" :class="{ active: getScopeMode(editingRule) === 'global' }" @click="setScopeMode('global')">全部书籍</button>
-              <button type="button" class="scope-btn" :class="{ active: getScopeMode(editingRule) === 'book' }" @click="setScopeMode('book')">当前书籍</button>
-              <button type="button" class="scope-btn" :class="{ active: getScopeMode(editingRule) === 'source' }" @click="setScopeMode('source')">当前书源</button>
+              <!-- 「当前书籍 / 当前书源」需要阅读上下文。从主设置打开时没有打开中的书,
+                   这两个按钮点下去只会静默无效, 因此直接不显示。 -->
+              <template v-if="!props.standalone">
+                <button type="button" class="scope-btn" :class="{ active: getScopeMode(editingRule) === 'book' }" @click="setScopeMode('book')">当前书籍</button>
+                <button type="button" class="scope-btn" :class="{ active: getScopeMode(editingRule) === 'source' }" @click="setScopeMode('source')">当前书源</button>
+              </template>
             </div>
             <div class="scope-preview">{{ describeScope(editingRule.scope) }}</div>
           </div>
@@ -84,6 +96,53 @@
         </div>
       </div>
     </Transition>
+
+    <!-- 导入面板：复用编辑面板的 .edit-overlay 层级与配色。
+         入口只有两个：直链（前端 fetch）与本地文件（前端 JSON.parse）。 -->
+    <Transition name="fade">
+      <div v-if="importPanelOpen" class="edit-overlay" :style="{ background: theme.popup }">
+        <div class="edit-header">
+          <h4>导入净化规则</h4>
+        </div>
+        <div class="edit-body">
+          <div class="form-item">
+            <label>规则 JSON 链接</label>
+            <input
+              v-model="importUrl"
+              type="url"
+              placeholder="https://example.test/replace-rules.json"
+              :disabled="importing"
+              @keyup.enter="importFromUrl"
+            >
+          </div>
+          <div class="import-hint">
+            支持 Legado 净化规则的 JSON 数组格式。pattern 或 replacement 以
+            <code>@js:</code> 开头的脚本规则暂不支持，导入时会自动跳过并统计。
+          </div>
+          <div class="import-actions">
+            <button class="op-btn" :disabled="importing" @click="importFromUrl">
+              {{ importing ? '导入中…' : '从网络导入' }}
+            </button>
+            <button class="op-btn" :disabled="importing" @click="localFileInputRef?.click()">
+              选择本地文件
+            </button>
+            <input
+              ref="localFileInputRef"
+              type="file"
+              accept=".json,application/json"
+              hidden
+              @change="handleLocalFile"
+            >
+          </div>
+          <div class="import-hint">
+            本地文件直接在前端解析。导入按规则名合并，同名规则会被覆盖。
+          </div>
+        </div>
+        <div class="edit-footer">
+          <button :disabled="importing" @click="closeImportPanel">取消</button>
+        </div>
+      </div>
+    </Transition>
   </div>
 </template>
 
@@ -91,17 +150,57 @@
 import { ref, computed, onMounted } from 'vue'
 import { useReaderStore } from '../../stores/reader'
 import { useAppStore } from '../../stores/app'
-import { saveReplaceRule, deleteReplaceRule } from '../../api/replaceRule'
+import { saveReplaceRule, saveReplaceRules, deleteReplaceRule } from '../../api/replaceRule'
+import {
+  buildReplaceRuleImportMessage,
+  normalizeLegadoReplaceRules,
+} from '../../utils/replaceRuleImport'
+import { compileReplaceRule } from '../../utils/replaceRuleRegex'
 import type { ReplaceRule } from '../../types'
 
 const store = useReaderStore()
 const appStore = useAppStore()
+
+/**
+ * 独立模式：从主设置抽屉打开时用。
+ *
+ * 此时组件不在阅读页的面板栈里，`store.backPanel()` 无从回退，所以关闭动作改成
+ * 向上抛事件；主题仍复用 `chromeTheme`（它只依赖全局主题与背景图配置，与是否
+ * 正在阅读无关），因此观感与阅读页里一致。
+ */
+const props = withDefaults(defineProps<{ standalone?: boolean }>(), { standalone: false })
+const emit = defineEmits<{ close: [] }>()
+
+function handleClose() {
+  if (props.standalone) {
+    emit('close')
+    return
+  }
+  store.backPanel()
+}
+
 const theme = computed(() => store.chromeTheme)
 const loading = ref(false)
 const editingRule = ref<ReplaceRule | null>(null)
 
+/* ─── 导入面板 ─── */
+const importPanelOpen = ref(false)
+const importUrl = ref('')
+const importing = ref(false)
+const localFileInputRef = ref<HTMLInputElement | null>(null)
+
 const sortedRules = computed(() => {
   return [...store.replaceRules].sort((a, b) => a.order - b.order)
+})
+
+/** 规则名 → 无法执行的原因。直接按规则本身编译判断, 不依赖"是否正在阅读"。 */
+const ruleIssues = computed(() => {
+  const issues = new Map<string, string>()
+  for (const rule of store.replaceRules) {
+    const compiled = compileReplaceRule(rule.pattern, rule.isRegex, rule.replacement)
+    if (compiled.kind === 'error') issues.set(rule.name, compiled.error)
+  }
+  return issues
 })
 
 function describeScope(scope?: string) {
@@ -129,6 +228,7 @@ onMounted(async () => {
 })
 
 function openEditModal(rule?: ReplaceRule) {
+  importPanelOpen.value = false
   if (rule) {
     editingRule.value = { ...rule }
   } else {
@@ -195,6 +295,106 @@ async function handleDelete(rule: ReplaceRule) {
     await store.fetchReplaceRules()
   } catch (e: any) {
     alert(e.message)
+  }
+}
+
+/* ─── 导入 ─── */
+
+function openImportPanel() {
+  // 两个面板都绝对定位铺满本面板, 同时开会互相盖住, 打开一个就关掉另一个。
+  editingRule.value = null
+  importUrl.value = ''
+  importPanelOpen.value = true
+}
+
+function closeImportPanel() {
+  if (importing.value) return
+  importPanelOpen.value = false
+}
+
+/** 直链导入用前端 fetch，而不是后端 readRemoteSourceFile。
+ *
+ *  为什么不能走后端: 那条命令会把响应反序列化成 BookSource，净化规则的
+ *  pattern/replacement 字段名对不上，会被整段丢掉，拿回来只剩空规则。
+ *  为什么 WebView 里直连可行: 该站返回 `access-control-allow-origin: *`，
+ *  且 tauri.conf.json 的 csp 是 null，不拦 fetch。
+ *  跨域被拒时 fetch 只抛 `TypeError: Failed to fetch`，对用户毫无信息量，
+ *  所以这里统一换成可读提示。 */
+async function fetchRulesJson(url: string): Promise<unknown> {
+  let response: Response
+  try {
+    response = await fetch(url, { cache: 'no-store' })
+  } catch {
+    throw new Error('无法从该地址获取规则：请检查网络连接，或该站点不允许跨域访问')
+  }
+  if (!response.ok) {
+    throw new Error(`获取规则失败：服务器返回 ${response.status}`)
+  }
+  const text = await response.text()
+  try {
+    return JSON.parse(text)
+  } catch {
+    throw new Error('该地址返回的不是合法 JSON（可能被重定向到了网页）')
+  }
+}
+
+/** 归一化 + 保存 + 提示，直链与本地文件两个入口共用。
+ *  全部被跳过时只提示、不写入 —— 保存空数组会让人误以为导入成功了。 */
+async function applyImportedRules(raw: unknown) {
+  const result = normalizeLegadoReplaceRules(raw)
+  const feedback = buildReplaceRuleImportMessage(result)
+  if (!result.rules.length) {
+    appStore.showToast(feedback.text, 'error')
+    return
+  }
+  await saveReplaceRules(result.rules)
+  const refreshed = await store.fetchReplaceRules()
+  importPanelOpen.value = false
+  // 保存成功但列表没拉回来时不能说"导入成功": 面板上看到的仍是旧列表,
+  // 用户会以为规则没进去。明确提示需要重开面板确认。
+  if (!refreshed) {
+    appStore.showToast(`${feedback.text}，但规则列表刷新失败，请重新打开本面板确认`, 'warning')
+    return
+  }
+  appStore.showToast(feedback.text, feedback.type)
+}
+
+async function importFromUrl() {
+  if (importing.value) return
+  const url = importUrl.value.trim()
+  if (!url) {
+    appStore.showToast('请输入规则 JSON 链接', 'warning')
+    return
+  }
+  importing.value = true
+  try {
+    await applyImportedRules(await fetchRulesJson(url))
+  } catch (error) {
+    appStore.showToast((error as Error).message || '导入失败', 'error')
+  } finally {
+    importing.value = false
+  }
+}
+
+async function handleLocalFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  importing.value = true
+  try {
+    let raw: unknown
+    try {
+      raw = JSON.parse(await file.text())
+    } catch {
+      throw new Error('文件内容不是合法 JSON')
+    }
+    await applyImportedRules(raw)
+  } catch (error) {
+    appStore.showToast((error as Error).message || '导入失败', 'error')
+  } finally {
+    importing.value = false
+    // 清空 value: 否则再次选同一个文件不会触发 change
+    input.value = ''
   }
 }
 </script>
@@ -297,6 +497,12 @@ async function handleDelete(rule: ReplaceRule) {
  * (暗灰 3.04:1, 等于该主题纯文字的可读上限)。
  * 与上面 .add-btn 同一条规则: 阅读页文字不混 --color-text。 */
 .rule-badge { font-size: 10px; background: color-mix(in srgb, var(--color-primary) 16%, transparent); color: currentColor; padding: 1px 4px; border-radius: 3px; }
+/* 无法执行: 用告警色而不是主题色, 避免和「正则」标签混在一起看不见。 */
+.rule-badge.warn {
+  background: color-mix(in srgb, #d9534f 18%, transparent);
+  color: #c9302c;
+  cursor: help;
+}
 .rule-scope { font-size: 12px; color: var(--color-primary); opacity: 0.9; margin-bottom: 4px; }
 
 .rule-pattern, .rule-replace {
@@ -392,6 +598,38 @@ input:checked + .slider:before { transform: translateX(16px); opacity: 1; }
 }
 
 .form-row { display: flex; align-items: center; gap: 20px; font-size: 13px; }
+
+/* 导入面板: 复用 .edit-overlay 的层级/配色, 只补它自己的排版。
+ * .import-actions 里的按钮放大到和编辑面板按钮一致的点击面积。 */
+.import-hint {
+  font-size: 12px;
+  opacity: 0.6;
+  line-height: 1.65;
+}
+
+.import-hint code {
+  font-size: 11px;
+  padding: 1px 3px;
+  border-radius: 3px;
+  background: color-mix(in srgb, currentColor 10%, transparent);
+}
+
+.import-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.import-actions .op-btn {
+  padding: 8px 14px;
+  font-size: 13px;
+  border-radius: 8px;
+}
+
+.import-actions .op-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 
 .order-input {
   width: 64px;

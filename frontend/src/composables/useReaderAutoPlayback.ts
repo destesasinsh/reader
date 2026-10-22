@@ -1,6 +1,10 @@
-import type { ComputedRef, Ref } from 'vue'
+import { nextTick, watch, type ComputedRef, type Ref } from 'vue'
 import type { useReaderStore } from '../stores/reader'
+import { useAppStore } from '../stores/app'
 import { cancelPageScrollAnimation } from '../utils/readerPaging'
+import { splitSpeechSegments } from '../utils/speechSegments'
+import { hasSpeakableContent } from '../utils/speakableText'
+import { SpeechStream, type SpeechChunk, type SpeechChunkType } from '../utils/speechStream'
 
 type ReaderStore = ReturnType<typeof useReaderStore>
 const OPENAI_SPEECH_CHUNK_CHAR_LIMIT = 70
@@ -184,11 +188,17 @@ export function useReaderAutoPlayback(
     return chunks
   }
 
-  function buildParagraphSpeechChunks(paragraph: HTMLElement | null) {
-    const rawText = paragraph?.innerText.trim() || ''
-    if (!rawText) return [] as string[]
+  /**
+   * 把一段正文按句号切成适合一次合成的短块（openai 通道的 70 字限制）。
+   *
+   * 拆成接受纯文本而不是 HTMLElement：缓冲流还要为**尚未渲染到 DOM 的下一章**
+   * 预切块（跨章预取），那些文本只能从 store 的正文里来。
+   */
+  function buildSpeechChunksFromText(rawText: string) {
+    const text = rawText.trim()
+    if (!text) return [] as string[]
 
-    const sentences = rawText
+    const sentences = text
       .replace(/\n+/g, '\n')
       .split(/(?<=[。！？!?；;])/)
       .map((item) => item.trim())
@@ -203,7 +213,7 @@ export function useReaderAutoPlayback(
       current = ''
     }
 
-    for (const sentence of (sentences.length ? sentences : [rawText])) {
+    for (const sentence of (sentences.length ? sentences : [text])) {
       if (sentence.length > OPENAI_SPEECH_CHUNK_CHAR_LIMIT) {
         pushCurrent()
         chunks.push(...splitLongSentence(sentence))
@@ -219,7 +229,11 @@ export function useReaderAutoPlayback(
     }
 
     pushCurrent()
-    return chunks.length ? chunks : [rawText]
+    return chunks.length ? chunks : [text]
+  }
+
+  function buildParagraphSpeechChunks(paragraph: HTMLElement | null) {
+    return buildSpeechChunksFromText(paragraph?.innerText.trim() || '')
   }
 
   function buildMergedSpeechSegment(paragraph: HTMLElement | null): SpeechSegment {
@@ -479,6 +493,331 @@ export function useReaderAutoPlayback(
     }
   }
 
+  /* ─── 缓冲流朗读（http / openai） ─────────────────────────────────────────
+   *
+   * system 通道继续走 store.startTTS 的浏览器语音队列（本身就是缓冲的）；
+   * http/openai 的请求-播放是严格串行的，每块之间都有网络空档，所以改用
+   * SpeechStream：边播边补，双 <audio> 无缝切换。
+   *
+   * 文本供给按优先级：当前段落剩余块（initialUnitQueue）→ 本章后续段落（也在
+   * initialUnitQueue 里一次给出，由流按缓冲配额自行节制）→ 下一章正文（先用
+   * store.fetchChapterContent 取回缓存，切章时 loadChapter 命中缓存）。 */
+
+  interface SpeechStreamUnit extends SpeechChunk {
+    /** 该块对应本章第几个 DOM 段落，用于高亮/跟随滚动。 */
+    paragraphIndex: number
+  }
+
+  interface SpeechStreamSession {
+    bookUrl: string
+    /** 已经为哪一章规划过块（含跨章预取），预取下一章时以它 +1 为准。 */
+    lastChapterPlanned: number
+    unitQueue: SpeechStreamUnit[]
+    /** 当前章的 DOM 段落快照；切章后刷新。 */
+    domParagraphs: HTMLElement[]
+    stopped: boolean
+  }
+
+  let speechStreamSession: SpeechStreamSession | null = null
+  let activeSpeechStream: SpeechStream | null = null
+  /**
+   * 本次朗读已提示过的「单块失败」错误消息。
+   *
+   * SpeechStream 只负责单个流的去重；连续朗读跨段/跨章会创建新的流实例，
+   * 所以这里按「用户本次开始朗读」为范围再兜一层，避免换段后同一提示反复弹。
+   * 用户重新开始朗读（interruptCurrent=true）时清空。
+   */
+  const reportedSpeechChunkErrors = new Set<string>()
+  const appStore = useAppStore()
+
+  /** 正文 → 段落文本。与 ReaderView.formatChapterHtml 的纯文本分支保持一致的切分。 */
+  function splitChapterContentIntoParagraphs(content: string): string[] {
+    let text = content
+    if (/<[a-z][\s\S]*>/i.test(content)) {
+      // 书源正文可能是 HTML：把块级标签换成换行，再去标签/解常见实体，得到可朗读文本。
+      text = content
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<\/(p|div|li|h\d|tr)>/gi, '\n')
+        .replace(/<[^>]+>/g, '')
+        .replace(/&nbsp;/gi, ' ')
+        .replace(/&lt;/gi, '<')
+        .replace(/&gt;/gi, '>')
+        .replace(/&quot;/gi, '"')
+        .replace(/&#39;/gi, "'")
+        .replace(/&amp;/gi, '&')
+    }
+    return text
+      .split(/\n/)
+      .map((line) => line.replace(/^[\u3000\u00A0 \t]+/, '').trim())
+      .filter(Boolean)
+  }
+
+  /** 一段文本 → 缓冲流的块（含双音色按引号标注旁白/对话）。 */
+  function buildChunkPieces(text: string): Array<{ text: string; type: SpeechChunkType }> {
+    // openai / edge / msdemo 都是「一次网络合成一段音频」：按句切成 ≤70 字的块，
+    // 首播只需等第一小块；http 引擎的请求按整段模板展开，切碎反而增加请求数，故不切。
+    const sentenceChunked = store.speechConfig.provider === 'openai'
+      || store.speechConfig.provider === 'edge'
+      || store.speechConfig.provider === 'msdemo'
+    // 纯标点的块（`……`、只剩引号的 `“……”`）在线服务不会返回音频，发给后端只会
+    // 换来错误并可能打断整段朗读，这里直接丢弃；整段都被丢弃时上层会跳过该段。
+    const pieces = (sentenceChunked ? buildSpeechChunksFromText(text) : [text.trim()])
+      .filter((piece) => hasSpeakableContent(piece))
+    if (!store.speechConfig.dualVoiceEnabled) {
+      return pieces.map((piece) => ({ text: piece, type: 'narration' as const }))
+    }
+    return pieces.flatMap((piece) => (
+      splitSpeechSegments(piece)
+        .filter((segment) => hasSpeakableContent(segment.text))
+        .map((segment) => ({ text: segment.text, type: segment.type }))
+    ))
+  }
+
+  /** 段落属于哪一章：连续阅读模式下本章之外还有别的章节 DOM。 */
+  function paragraphChapterIndex(paragraph: HTMLElement): number {
+    if (!isContinuousMode.value) return store.currentIndex
+    const section = paragraph.closest?.('.continuous-chapter') as HTMLElement | null
+    const raw = section?.dataset?.chapterIndex
+    const parsed = raw == null ? Number.NaN : Number(raw)
+    return Number.isFinite(parsed) ? parsed : store.currentIndex
+  }
+
+  /**
+   * 收集从 startParagraph 开始的本章朗读块。
+   *
+   * 连续阅读模式只收「同一章」的段落：跨章时 DOM 结构会在切章时重建，提前把
+   * 别的章节混进来会让高亮映射错位；那里改由 idle → continueSpeechTarget 走
+   * 现有切章流程（连续模式本身已经预渲染了后续章节，空档很小）。
+   */
+  function collectDomSpeechUnits(startParagraph: HTMLElement, chapterIndex: number) {
+    const list = getFilteredParagraphs()
+    const startIndex = Math.max(0, list.indexOf(startParagraph))
+    const domParagraphs: HTMLElement[] = []
+    const units: SpeechStreamUnit[] = []
+    for (let index = startIndex; index < list.length; index += 1) {
+      const paragraph = list[index]
+      if (paragraphChapterIndex(paragraph) !== chapterIndex) break
+      const text = paragraph.innerText.trim()
+      if (!text) continue
+      const paragraphIndex = domParagraphs.length
+      domParagraphs.push(paragraph)
+      for (const piece of buildChunkPieces(text)) {
+        units.push({ ...piece, chapterIndex, paragraphIndex })
+      }
+    }
+    return { units, domParagraphs }
+  }
+
+  /**
+   * 跨章预取：取下一章正文并切成块。
+   *
+   * 这里只取正文（会进 store 的正文缓存），不切换当前章；播放到这些块时由
+   * onChapterChange 调 nextChapter()，届时 loadChapter 命中缓存，几乎瞬间完成。
+   */
+  async function prefetchNextChapterUnits(session: SpeechStreamSession): Promise<SpeechStreamUnit[]> {
+    if (isContinuousMode.value) return []
+    const nextChapter = session.lastChapterPlanned + 1
+    if (nextChapter >= store.chapters.length) return []
+    const content = await store.fetchChapterContent(nextChapter).catch(() => null)
+    if (session.stopped || !content) return []
+    const processed = store.processContentForDisplay(content)
+    const paragraphs = splitChapterContentIntoParagraphs(processed)
+    if (!paragraphs.length) return []
+    const units: SpeechStreamUnit[] = []
+    paragraphs.forEach((paragraphText, paragraphIndex) => {
+      for (const piece of buildChunkPieces(paragraphText)) {
+        units.push({ ...piece, chapterIndex: nextChapter, paragraphIndex })
+      }
+    })
+    session.lastChapterPlanned = nextChapter
+    return units
+  }
+
+  async function supplySpeechUnits(session: SpeechStreamSession): Promise<SpeechChunk[]> {
+    if (session.stopped) return []
+    // 本章（含开头一次性收集的剩余段落）优先。
+    if (session.unitQueue.length) return session.unitQueue.splice(0, session.unitQueue.length)
+    // 书末 / 连续模式：交给 onIdle → continueSpeechTarget 走原切章流程。
+    if (!store.hasNext) return []
+    const units = await prefetchNextChapterUnits(session)
+    if (session.stopped || !units.length) return []
+    return units
+  }
+
+  /** 找到块对应的 DOM 段落（切章后按段落序号优先，文本匹配兜底）。 */
+  function resolveUnitParagraph(session: SpeechStreamSession, unit: SpeechStreamUnit): HTMLElement | null {
+    const direct = session.domParagraphs[unit.paragraphIndex]
+    if (direct && direct.isConnected) return direct
+    const probe = unit.text.slice(0, 12)
+    return session.domParagraphs.find((paragraph) => paragraph.isConnected && paragraph.innerText.includes(probe)) || null
+  }
+
+  function stopSpeechStream() {
+    const session = speechStreamSession
+    const stream = activeSpeechStream
+    speechStreamSession = null
+    activeSpeechStream = null
+    if (session) session.stopped = true
+    if (stream) {
+      // 先摘句柄再停流：stop() 不再回到 store，避免 store.stopTTS 重入。
+      store.attachSpeechStreamControls(null)
+      stream.stop()
+    }
+  }
+
+  /** 流自然结束（onIdle）或出错后的清理：停流并摘掉句柄。 */
+  function releaseSpeechStream(session: SpeechStreamSession) {
+    session.stopped = true
+    if (speechStreamSession === session) speechStreamSession = null
+    if (activeSpeechStream) {
+      activeSpeechStream.stop()
+      activeSpeechStream = null
+    }
+    store.attachSpeechStreamControls(null)
+  }
+
+  function startBufferedSpeech(paragraph: HTMLElement, interruptCurrent: boolean) {
+    // 新会话先彻底停掉旧流（它的在途请求与 audio 都要释放）。
+    stopSpeechStream()
+    if (interruptCurrent) {
+      // 用户主动开始新一轮朗读：单块失败提示的去重范围随之重置。
+      reportedSpeechChunkErrors.clear()
+      // 停掉可能还在跑的系统语音 / 单段播放（它们不走流）。
+      store.stopTTS(false)
+    }
+    resetSpeechChunkState()
+    markReadingParagraph(paragraph)
+    showParagraph(paragraph)
+
+    const chapterIndex = store.currentIndex
+    const bookUrl = store.book?.bookUrl || ''
+    const { units, domParagraphs } = collectDomSpeechUnits(paragraph, chapterIndex)
+    if (!units.length) {
+      continueSpeechTarget(getNextParagraphFrom(paragraph))
+      return
+    }
+
+    const session: SpeechStreamSession = {
+      bookUrl,
+      lastChapterPlanned: chapterIndex,
+      unitQueue: units,
+      domParagraphs,
+      stopped: false,
+    }
+    speechStreamSession = session
+
+    const stream = new SpeechStream({
+      supply: () => supplySpeechUnits(session),
+      synthesize: (chunk, signal) => store.synthesizeSpeechChunkBlob(chunk.text, chunk.type, signal),
+      onChunkStart: (chunk) => {
+        if (session.stopped) return
+        const unit = chunk as SpeechStreamUnit
+        store.isSpeechLoading = false
+        store.isSpeaking = true
+        store.isPaused = false
+        const target = resolveUnitParagraph(session, unit)
+        if (target) {
+          markReadingParagraph(target)
+          showParagraph(target)
+        }
+      },
+      onChunkProgress: (_chunk, progress) => {
+        if (session.stopped) return
+        store.speechProgress = progress
+      },
+      onChapterChange: async (nextChapterIndex) => {
+        if (session.stopped) return
+        if (session.bookUrl !== (store.book?.bookUrl || '')) {
+          stopSpeechStream()
+          return
+        }
+        // 预取可能跑得比播放快，一次要跨多章时逐章推进。
+        while (store.currentIndex < nextChapterIndex) {
+          if (!store.hasNext) {
+            stopSpeechStream()
+            return
+          }
+          await nextChapter()
+          if (session.stopped) return
+        }
+        if (store.currentIndex !== nextChapterIndex) {
+          // 用户手动跳到了别的章，流已经对不上文本，直接停掉。
+          stopSpeechStream()
+          return
+        }
+        await nextTick()
+        if (session.stopped) return
+        session.domParagraphs = getFilteredParagraphs()
+        clearReadingClass()
+        const first = session.domParagraphs[0]
+        if (first) {
+          markReadingParagraph(first)
+          showParagraph(first, false)
+        }
+      },
+      onIdle: () => {
+        if (session.stopped) return
+        releaseSpeechStream(session)
+        store.isSpeechLoading = false
+        store.isSpeaking = false
+        store.speechProgress = 0
+        // 本章读完：沿用既有「继续下一段/下一章」的推进逻辑。
+        continueSpeechTarget(null)
+      },
+      onChunkError: (error) => {
+        if (session.stopped) return
+        const message = error.message || '朗读失败'
+        logSpeech('speech chunk skipped', { message })
+        // 单块失败已在流内重试一次并跳过，不中断朗读。提示措辞刻意不提「通道不可用」：
+        // 纯标点片段服务端本来就不返回音频，让用户换通道只会误导。同一错误在本次朗读中
+        // 只提示一次（跨流实例也去重），SpeechStream 内部另有单流去重作为第一道。
+        if (reportedSpeechChunkErrors.has(message)) return
+        reportedSpeechChunkErrors.add(message)
+        appStore.showToast(`已跳过朗读失败的片段：${message}`, 'warning')
+      },
+      onError: (error) => {
+        if (session.stopped) return
+        releaseSpeechStream(session)
+        const message = error.message || '朗读失败'
+        logSpeech('speech stream error', { message })
+        appStore.showToast(message, 'error')
+        store.isSpeechLoading = false
+        store.isSpeaking = false
+        store.isPaused = false
+        store.speechProgress = 0
+        resetSpeechChunkState()
+        clearReadingClass()
+        // 摘掉流句柄后让 store 复位状态（不会再次 stop 流）。
+        store.stopTTS()
+      },
+    }, {
+      bufferChars: store.speechConfig.bufferChars,
+      maxConcurrent: 2,
+    })
+    activeSpeechStream = stream
+    store.attachSpeechStreamControls({
+      pause: () => stream.pause(),
+      resume: () => stream.resume(),
+      stop: () => {
+        session.stopped = true
+        if (speechStreamSession === session) speechStreamSession = null
+        if (activeSpeechStream === stream) activeSpeechStream = null
+        stream.stop()
+      },
+    })
+    store.isSpeechLoading = true
+    store.isSpeaking = false
+    store.isPaused = false
+    store.speechProgress = 0
+    logSpeech('start buffered speech', {
+      provider: store.speechConfig.provider,
+      chapterIndex,
+      chunks: units.length,
+      bufferChars: store.speechConfig.bufferChars,
+    })
+    stream.start()
+  }
+
   function restartSpeechTarget(paragraph: HTMLElement | null, interruptCurrent = true) {
     logSpeech('restartSpeechTarget', {
       interruptCurrent,
@@ -581,6 +920,14 @@ export function useReaderAutoPlayback(
       } else {
         continueSpeechTarget(getNextParagraph())
       }
+      return
+    }
+
+    // http / openai / edge / msdemo 的请求-播放是串行的，走缓冲流把网络等待藏到
+    // 播放后面；system 的浏览器语音队列本身就是缓冲，保持原逻辑。
+    const provider = store.speechConfig.provider
+    if (provider === 'http' || provider === 'openai' || provider === 'edge' || provider === 'msdemo') {
+      startBufferedSpeech(current, interruptCurrent)
       return
     }
 
@@ -725,7 +1072,15 @@ export function useReaderAutoPlayback(
   function disposeAutoPlayback() {
     cancelSpeechTransition()
     stopAutoScroll()
+    // 组件卸载（离开阅读页）时必须把缓冲流停掉：它持有 audio 与在途请求，
+    // 不清理会继续出声，而用户已经没有任何入口关掉它。
+    stopSpeechStream()
   }
+
+  // 换书/关闭书籍时文本与 DOM 都变了，仍在跑的流（含跨章预取）必须终止。
+  watch(() => store.book?.bookUrl, (bookUrl, previous) => {
+    if (previous && bookUrl !== previous) stopSpeechStream()
+  })
 
   return {
     getCurrentParagraph,

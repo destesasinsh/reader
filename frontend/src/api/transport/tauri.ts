@@ -94,6 +94,14 @@ export const COMMAND_BY_PATH: Record<string, string> = {
   '/reader3/saveReplaceRules': 'save_replace_rules',
   '/reader3/deleteReplaceRule': 'delete_replace_rule',
   '/reader3/deleteReplaceRules': 'delete_replace_rules',
+  // 净化脚本规则：只在前端存在 @js: 规则时才会走到（普通规则走前端同步快路径）。
+  '/reader3/applyReplaceRules': 'apply_replace_rules',
+  // Edge 朗读：音色列表走信封，合成结果是二进制 mp3（api/edgeTts.ts 用 invokeRaw）。
+  '/reader3/edgeTtsListVoices': 'edge_tts_list_voices',
+  '/reader3/synthesizeEdgeTts': 'edge_tts_synthesize',
+  // 微软朗读（演示接口）：同样支持风格与多档音质。
+  '/reader3/msTtsListVoices': 'ms_tts_list_voices',
+  '/reader3/synthesizeMsTts': 'ms_tts_synthesize',
   '/reader3/getWebdavFileList': 'get_webdav_file_list',
   '/reader3/getWebdavFile': 'get_webdav_file',
   '/reader3/getWebdavBackupArchive': 'get_webdav_backup_archive',

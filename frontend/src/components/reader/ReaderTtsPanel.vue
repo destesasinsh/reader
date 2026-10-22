@@ -159,7 +159,8 @@ const props = defineProps<{
   show: boolean
   theme: ThemePreset | { popup: string; fontColor: string }
   chapterTitle?: string
-  provider: 'system' | 'openai'
+  /** http / edge / msdemo 与 openai 一样是「整段音频」形态，面板只按此区分是否显示 API 语音信息。 */
+  provider: 'system' | 'openai' | 'http' | 'edge' | 'msdemo'
   providerLabel: string
   isSpeaking: boolean
   isLoading: boolean

@@ -12,16 +12,19 @@
     <div class="settings-header">
       <h3 class="settings-title">设置</h3>
       <button
+        v-if="!standalone"
         class="reset-btn"
         title="重置排版参数；阅读配色与背景图会保留"
         @click="store.resetConfig()"
       >重置为默认配置</button>
+      <!-- 独立模式从主设置抽屉打开, 需要一个自己的关闭入口。 -->
+      <button v-else class="reset-btn" @click="emit('close')">关闭</button>
     </div>
     <div class="settings-sep"></div>
 
     <nav class="reader-settings-tabs" aria-label="阅读设置分类">
       <button
-        v-for="tab in readerSettingsTabs"
+        v-for="tab in visibleTabs"
         :key="tab.value"
         type="button"
         :class="{ active: activeSettingsTab === tab.value }"
@@ -453,20 +456,124 @@
             @click="store.setSpeechProvider('system')"
           >系统语音</button>
           <button class="opt-btn" :class="{ active: store.speechConfig.provider === 'openai' }" @click="store.setSpeechProvider('openai')">API 语音</button>
+          <button
+            class="opt-btn"
+            :class="{ active: store.speechConfig.provider === 'http' }"
+            title="使用 Legado 在线朗读引擎（httpTTS）"
+            @click="store.setSpeechProvider('http')"
+          >在线朗读引擎</button>
+          <button
+            class="opt-btn"
+            :class="{ active: store.speechConfig.provider === 'edge' }"
+            title="使用微软 Edge 在线朗读（无需 API Key）"
+            @click="store.setSpeechProvider('edge')"
+          >Edge 朗读</button>
+          <button
+            class="opt-btn"
+            :class="{ active: store.speechConfig.provider === 'msdemo' }"
+            title="微软朗读（演示接口）：支持风格与更高音质，无需 API Key"
+            @click="store.setSpeechProvider('msdemo')"
+          >微软朗读</button>
         </div>
       </div>
 
-      <div v-if="store.speechConfig.provider === 'system'" class="setting-row setting-row-top">
-        <label>朗读音源</label>
-        <select class="voice-select" :value="store.speechConfig.voiceName" @change="handleVoiceChange">
-          <option value="">系统默认</option>
-          <option v-for="voice in store.voiceList" :key="voice.name" :value="voice.name">
-            {{ voice.name }} ({{ voice.lang }})
-          </option>
-        </select>
+      <!-- 旁白/对话模式：先选模式再配音色（原来在页签末尾，用户实测找不到）。 -->
+      <div class="setting-row">
+        <label>旁白/对话</label>
+        <div class="btn-group">
+          <button
+            class="opt-btn"
+            :class="{ active: !store.speechConfig.dualVoiceEnabled }"
+            @click="store.setDualVoiceEnabled(false)"
+          >同音色</button>
+          <button
+            class="opt-btn"
+            :class="{ active: store.speechConfig.dualVoiceEnabled }"
+            title="按中文引号切分正文：旁白与对话分别用不同音色"
+            @click="store.setDualVoiceEnabled(true)"
+          >分音色</button>
+        </div>
       </div>
+      <p v-if="store.speechConfig.dualVoiceEnabled" class="setting-hint">
+        对话指中文引号（“…” / 「…」 / 『…』）内的内容；引号未闭合时，其后一直按对话朗读。
+      </p>
 
-      <template v-else>
+      <!-- 系统语音：整块包在 template 里，保证下面其它通道仍能与它组成
+           v-if / v-else-if / v-else 链（中间插一个独立 v-if 会截断链，
+           其它 provider 会落进最后一个 v-else 里渲染出错误的表单）。 -->
+      <template v-if="store.speechConfig.provider === 'system'">
+        <template v-if="store.speechConfig.dualVoiceEnabled">
+          <div class="setting-block voice-partition">
+            <div class="setting-block-head"><label>旁白</label></div>
+            <select class="voice-select" :value="store.speechConfig.voiceName" @change="handleVoiceChange">
+              <option value="">系统默认</option>
+              <option v-for="voice in store.voiceList" :key="voice.name" :value="voice.name">
+                {{ voice.name }} ({{ voice.lang }})
+              </option>
+            </select>
+          </div>
+          <div class="setting-block voice-partition">
+            <div class="setting-block-head"><label>对话</label></div>
+            <select
+              class="voice-select"
+              :value="store.speechConfig.dialogueVoiceName"
+              @change="store.setDialogueVoiceName(($event.target as HTMLSelectElement).value)"
+            >
+              <option value="">跟随旁白音色</option>
+              <option v-for="voice in store.voiceList" :key="voice.name" :value="voice.name">
+                {{ voice.name }} ({{ voice.lang }})
+              </option>
+            </select>
+          </div>
+        </template>
+        <div v-else class="setting-block">
+          <div class="setting-block-head"><label>音色</label></div>
+          <select class="voice-select" :value="store.speechConfig.voiceName" @change="handleVoiceChange">
+            <option value="">系统默认</option>
+            <option v-for="voice in store.voiceList" :key="voice.name" :value="voice.name">
+              {{ voice.name }} ({{ voice.lang }})
+            </option>
+          </select>
+        </div>
+      </template>
+
+      <!-- 注意不能写 v-else：第三方 provider 会把下面的 API 表单一起吃掉。
+           在线朗读引擎没有 API 表单，必须显式排除。 -->
+      <template v-else-if="store.speechConfig.provider === 'openai'">
+        <!-- 音色放在最前：旁白/对话两个独立分区，后面才是共享的接口参数。 -->
+        <template v-if="store.speechConfig.dualVoiceEnabled">
+          <div class="setting-block voice-partition">
+            <div class="setting-block-head"><label>旁白</label></div>
+            <input
+              class="voice-select"
+              type="text"
+              :value="store.speechConfig.openaiVoice"
+              :placeholder="selectedSpeechApiFormat.voicePlaceholder"
+              @input="store.setOpenAISpeechVoice(($event.target as HTMLInputElement).value)"
+            >
+          </div>
+          <div class="setting-block voice-partition">
+            <div class="setting-block-head"><label>对话</label></div>
+            <input
+              class="voice-select"
+              type="text"
+              :value="store.speechConfig.dialogueOpenaiVoice"
+              :placeholder="`留空跟随旁白音色（${store.speechConfig.openaiVoice || '默认'}）`"
+              @input="store.setDialogueOpenaiVoice(($event.target as HTMLInputElement).value)"
+            >
+          </div>
+        </template>
+        <div v-else class="setting-block">
+          <div class="setting-block-head"><label>音色</label></div>
+          <input
+            class="voice-select"
+            type="text"
+            :value="store.speechConfig.openaiVoice"
+            :placeholder="selectedSpeechApiFormat.voicePlaceholder"
+            @input="store.setOpenAISpeechVoice(($event.target as HTMLInputElement).value)"
+          >
+        </div>
+
         <div class="setting-row setting-row-top">
           <label>接口格式</label>
           <select
@@ -526,17 +633,6 @@
         </div>
 
         <div class="setting-row setting-row-top">
-          <label>语音音色</label>
-          <input
-            class="voice-select"
-            type="text"
-            :value="store.speechConfig.openaiVoice"
-            :placeholder="selectedSpeechApiFormat.voicePlaceholder"
-            @input="store.setOpenAISpeechVoice(($event.target as HTMLInputElement).value)"
-          >
-        </div>
-
-        <div class="setting-row setting-row-top">
           <label>音频格式</label>
           <select
             class="voice-select"
@@ -570,6 +666,404 @@
         </div>
       </template>
 
+      <template v-else-if="store.speechConfig.provider === 'http'">
+        <!-- 一个引擎就是一个音色：双音色时旁白/对话各选一个引擎（两个独立分区），
+             引擎管理入口放在两块之后（共享操作）。 -->
+        <template v-if="store.speechConfig.dualVoiceEnabled">
+          <div class="setting-block voice-partition">
+            <div class="setting-block-head"><label>旁白</label></div>
+            <select
+              class="voice-select"
+              :value="selectedHttpTtsId"
+              @change="handleHttpTtsChange"
+            >
+              <option value="">请选择在线朗读引擎</option>
+              <option v-for="engine in httpTtsList" :key="engine.id" :value="String(engine.id)">
+                {{ engine.name }}
+              </option>
+            </select>
+          </div>
+          <div class="setting-block voice-partition">
+            <div class="setting-block-head"><label>对话</label></div>
+            <select
+              class="voice-select"
+              :value="selectedDialogueHttpTtsId"
+              @change="handleDialogueHttpTtsChange"
+            >
+              <option value="">跟随旁白引擎</option>
+              <option v-for="engine in httpTtsList" :key="engine.id" :value="String(engine.id)">
+                {{ engine.name }}
+              </option>
+            </select>
+          </div>
+        </template>
+        <div v-else class="setting-block">
+          <div class="setting-block-head"><label>音色</label></div>
+          <div class="http-tts-picker">
+            <select
+              class="voice-select"
+              :value="selectedHttpTtsId"
+              @change="handleHttpTtsChange"
+            >
+              <option value="">请选择在线朗读引擎</option>
+              <option v-for="engine in httpTtsList" :key="engine.id" :value="String(engine.id)">
+                {{ engine.name }}
+              </option>
+            </select>
+          </div>
+        </div>
+        <div class="setting-row">
+          <label>引擎管理</label>
+          <div class="btn-group">
+            <button class="opt-btn" type="button" @click="showHttpTtsManager = true">管理引擎</button>
+          </div>
+        </div>
+        <p v-if="!httpTtsList.length" class="setting-hint">
+          {{ httpTtsLoading
+            ? '正在读取已导入的引擎…'
+            : '还没有导入在线朗读引擎。点「管理引擎」，可从直链或本地 JSON 文件导入。' }}
+        </p>
+      </template>
+
+      <!-- Edge 朗读：音色来自微软公共接口（后端代理），默认只列中文音色；
+           322 个音色全列出来会淹没选择，切「显示全部语言」才展开。 -->
+      <template v-else-if="store.speechConfig.provider === 'edge'">
+        <!-- 双音色：旁白/对话两个独立分区，各自选音色；语言筛选开关两块共用。 -->
+        <template v-if="store.speechConfig.dualVoiceEnabled">
+          <div class="setting-block voice-partition">
+            <div class="setting-block-head">
+              <label>旁白</label>
+              <button class="link-btn" type="button" @click="showAllEdgeLocales = !showAllEdgeLocales">
+                {{ showAllEdgeLocales ? '只看中文' : '显示全部语言' }}
+              </button>
+            </div>
+            <select
+              class="voice-select"
+              :value="store.speechConfig.edgeVoice"
+              @change="store.setEdgeVoice(($event.target as HTMLSelectElement).value)"
+            >
+              <option v-if="!edgeVoiceOptions.length" :value="store.speechConfig.edgeVoice">
+                {{ store.speechConfig.edgeVoice }}
+              </option>
+              <option v-for="voice in edgeVoiceOptions" :key="voice.shortName" :value="voice.shortName">
+                {{ edgeVoiceLabel(voice) }}
+              </option>
+            </select>
+          </div>
+          <div class="setting-block voice-partition">
+            <div class="setting-block-head"><label>对话</label></div>
+            <select
+              class="voice-select"
+              :value="store.speechConfig.edgeDialogueVoice"
+              @change="store.setEdgeDialogueVoice(($event.target as HTMLSelectElement).value)"
+            >
+              <option value="">跟随旁白音色</option>
+              <option v-for="voice in edgeVoiceOptions" :key="voice.shortName" :value="voice.shortName">
+                {{ edgeVoiceLabel(voice) }}
+              </option>
+            </select>
+          </div>
+        </template>
+        <div v-else class="setting-block">
+          <div class="setting-block-head">
+            <label>音色</label>
+            <button class="link-btn" type="button" @click="showAllEdgeLocales = !showAllEdgeLocales">
+              {{ showAllEdgeLocales ? '只看中文' : '显示全部语言' }}
+            </button>
+          </div>
+          <select
+            class="voice-select"
+            :value="store.speechConfig.edgeVoice"
+            @change="store.setEdgeVoice(($event.target as HTMLSelectElement).value)"
+          >
+            <option v-if="!edgeVoiceOptions.length" :value="store.speechConfig.edgeVoice">
+              {{ store.speechConfig.edgeVoice }}
+            </option>
+            <option v-for="voice in edgeVoiceOptions" :key="voice.shortName" :value="voice.shortName">
+              {{ edgeVoiceLabel(voice) }}
+            </option>
+          </select>
+        </div>
+        <!-- 共享参数（音调/音量/音质）放在音色分区之后，双音色时只出现一次。 -->
+        <!-- Edge 音调/音量：SSML 的 pitch/volume，只对 Edge 通道生效；
+             语速继续用全局「朗读语速」，不在这里重复。 -->
+        <div class="setting-row slider-row">
+          <div class="slider-head">
+            <label>音调</label>
+            <span class="slider-value">{{ store.speechConfig.edgePitch }} Hz</span>
+            <button
+              v-if="store.speechConfig.edgePitch !== 0"
+              class="link-btn"
+              type="button"
+              @click="store.setEdgePitch(0)"
+            >回正</button>
+          </div>
+          <input
+            class="settings-slider"
+            type="range"
+            :min="EDGE_PITCH_MIN"
+            :max="EDGE_PITCH_MAX"
+            step="5"
+            :value="store.speechConfig.edgePitch"
+            @input="store.setEdgePitch(Number(($event.target as HTMLInputElement).value))"
+          >
+        </div>
+        <div class="setting-row slider-row">
+          <div class="slider-head">
+            <label>音量</label>
+            <span class="slider-value">{{ store.speechConfig.edgeVolume }} %</span>
+            <button
+              v-if="store.speechConfig.edgeVolume !== 0"
+              class="link-btn"
+              type="button"
+              @click="store.setEdgeVolume(0)"
+            >回正</button>
+          </div>
+          <input
+            class="settings-slider"
+            type="range"
+            :min="EDGE_VOLUME_MIN"
+            :max="EDGE_VOLUME_MAX"
+            step="5"
+            :value="store.speechConfig.edgeVolume"
+            @input="store.setEdgeVolume(Number(($event.target as HTMLInputElement).value))"
+          >
+        </div>
+        <!-- 音质：Edge 只支持 48k/96k 两档 outputFormat，96k 字节数约为 2 倍。 -->
+        <div class="setting-row setting-row-top">
+          <label>音质</label>
+          <select
+            class="voice-select"
+            :value="store.speechConfig.edgeFormat"
+            @change="store.setEdgeFormat(($event.target as HTMLSelectElement).value as EdgeTtsFormat)"
+          >
+            <option value="48k">标准（48kbps）</option>
+            <option value="96k">高（96kbps，音质更好、流量约 2 倍）</option>
+          </select>
+        </div>
+
+        <p class="setting-hint">
+          音调 / 音量 / 音质只对 Edge 通道生效；语速请用下方「朗读语速」。
+        </p>
+
+        <p class="setting-hint">
+          {{ edgeVoicesLoading
+            ? '正在读取 Edge 音色…'
+            : '无需 API Key；这是微软的公共接口，偶尔可能不可用。' }}
+          <template v-if="edgeVoiceError">（{{ edgeVoiceError }}）</template>
+        </p>
+      </template>
+
+      <!-- 微软朗读（演示接口）：比 Edge 多了风格 style / 风格强度，音质有 192k 档。
+           音色 958 个、zh-CN 84 个，默认只列中文，可切「显示全部语言」。 -->
+      <template v-else>
+        <!-- 双音色：旁白/对话两个分区，各自「音色 + 风格」；共享参数在后面只出现一次。 -->
+        <template v-if="store.speechConfig.dualVoiceEnabled">
+          <div class="setting-block voice-partition">
+            <div class="setting-block-head">
+              <label>旁白</label>
+              <button class="link-btn" type="button" @click="showAllMsLocales = !showAllMsLocales">
+                {{ showAllMsLocales ? '只看中文' : '显示全部语言' }}
+              </button>
+            </div>
+            <div class="setting-row setting-row-top">
+              <label>音色</label>
+              <select
+                class="voice-select"
+                :value="store.speechConfig.msVoice"
+                @change="store.setMsVoice(($event.target as HTMLSelectElement).value)"
+              >
+                <option v-if="!msVoiceOptions.length" :value="store.speechConfig.msVoice">
+                  {{ store.speechConfig.msVoice }}
+                </option>
+                <option v-for="voice in msVoiceOptions" :key="voice.shortName" :value="voice.shortName">
+                  {{ msVoiceLabel(voice) }}
+                </option>
+              </select>
+            </div>
+            <div class="setting-row setting-row-top">
+              <label>风格</label>
+              <select
+                class="voice-select"
+                :value="store.speechConfig.msStyle"
+                @change="store.setMsStyle(($event.target as HTMLSelectElement).value)"
+              >
+                <option value="">无风格</option>
+                <option v-for="style in msStyleOptions" :key="style" :value="style">{{ style }}</option>
+              </select>
+            </div>
+          </div>
+          <div class="setting-block voice-partition">
+            <div class="setting-block-head"><label>对话</label></div>
+            <div class="setting-row setting-row-top">
+              <label>音色</label>
+              <select
+                class="voice-select"
+                :value="store.speechConfig.msDialogueVoice"
+                @change="store.setMsDialogueVoice(($event.target as HTMLSelectElement).value)"
+              >
+                <option value="">跟随旁白音色</option>
+                <option v-for="voice in msVoiceOptions" :key="voice.shortName" :value="voice.shortName">
+                  {{ msVoiceLabel(voice) }}
+                </option>
+              </select>
+            </div>
+            <div class="setting-row setting-row-top">
+              <label>风格</label>
+              <select
+                class="voice-select"
+                :value="store.speechConfig.msDialogueStyle"
+                @change="store.setMsDialogueStyle(($event.target as HTMLSelectElement).value)"
+              >
+                <option value="">跟随旁白风格</option>
+                <option v-for="style in msDialogueStyleOptions" :key="style" :value="style">{{ style }}</option>
+              </select>
+            </div>
+          </div>
+        </template>
+        <template v-else>
+          <div class="setting-block">
+            <div class="setting-block-head">
+              <label>音色</label>
+              <button class="link-btn" type="button" @click="showAllMsLocales = !showAllMsLocales">
+                {{ showAllMsLocales ? '只看中文' : '显示全部语言' }}
+              </button>
+            </div>
+            <select
+              class="voice-select"
+              :value="store.speechConfig.msVoice"
+              @change="store.setMsVoice(($event.target as HTMLSelectElement).value)"
+            >
+              <option v-if="!msVoiceOptions.length" :value="store.speechConfig.msVoice">
+                {{ store.speechConfig.msVoice }}
+              </option>
+              <option v-for="voice in msVoiceOptions" :key="voice.shortName" :value="voice.shortName">
+                {{ msVoiceLabel(voice) }}
+              </option>
+            </select>
+          </div>
+          <!-- 风格选项来自当前音色自带的 StyleList；没有风格的音色只有「无风格」。 -->
+          <div class="setting-block">
+            <div class="setting-block-head"><label>风格</label></div>
+            <select
+              class="voice-select"
+              :value="store.speechConfig.msStyle"
+              @change="store.setMsStyle(($event.target as HTMLSelectElement).value)"
+            >
+              <option value="">无风格</option>
+              <option v-for="style in msStyleOptions" :key="style" :value="style">{{ style }}</option>
+            </select>
+          </div>
+        </template>
+
+        <!-- 共享参数（风格强度/音调/音量/音质）放在音色分区之后，双音色时只出现一次。 -->
+        <!-- 风格强度只在有风格时生效，所以没有风格时不显示，避免误导。 -->
+        <div v-if="showMsStyleDegree" class="setting-row slider-row">
+          <div class="slider-head">
+            <label>风格强度</label>
+            <span class="slider-value">{{ store.speechConfig.msStyleDegree.toFixed(1) }}</span>
+          </div>
+          <input
+            class="settings-slider"
+            type="range"
+            :min="MS_STYLE_DEGREE_MIN"
+            :max="MS_STYLE_DEGREE_MAX"
+            step="0.1"
+            :value="store.speechConfig.msStyleDegree"
+            @input="store.setMsStyleDegree(Number(($event.target as HTMLInputElement).value))"
+          >
+        </div>
+
+        <div class="setting-row slider-row">
+          <div class="slider-head">
+            <label>音调</label>
+            <span class="slider-value">{{ store.speechConfig.msPitch }} %</span>
+            <button
+              v-if="store.speechConfig.msPitch !== 0"
+              class="link-btn"
+              type="button"
+              @click="store.setMsPitch(0)"
+            >回正</button>
+          </div>
+          <input
+            class="settings-slider"
+            type="range"
+            :min="MS_PITCH_MIN"
+            :max="MS_PITCH_MAX"
+            step="5"
+            :value="store.speechConfig.msPitch"
+            @input="store.setMsPitch(Number(($event.target as HTMLInputElement).value))"
+          >
+        </div>
+        <div class="setting-row slider-row">
+          <div class="slider-head">
+            <label>音量</label>
+            <span class="slider-value">{{ store.speechConfig.msVolume }} %</span>
+            <button
+              v-if="store.speechConfig.msVolume !== 0"
+              class="link-btn"
+              type="button"
+              @click="store.setMsVolume(0)"
+            >回正</button>
+          </div>
+          <input
+            class="settings-slider"
+            type="range"
+            :min="MS_VOLUME_MIN"
+            :max="MS_VOLUME_MAX"
+            step="5"
+            :value="store.speechConfig.msVolume"
+            @input="store.setMsVolume(Number(($event.target as HTMLInputElement).value))"
+          >
+        </div>
+
+        <div class="setting-row setting-row-top">
+          <label>音质</label>
+          <select
+            class="voice-select"
+            :value="store.speechConfig.msFormat"
+            @change="store.setMsFormat(($event.target as HTMLSelectElement).value as MsTtsFormat)"
+          >
+            <option v-for="format in MS_FORMATS" :key="format" :value="format">
+              {{ format === '48k' ? '标准 48k' : format === '96k' ? '高 96k（默认）' : '超高 48kHz·192k' }}
+            </option>
+          </select>
+        </div>
+
+        <p class="setting-hint">
+          {{ msVoicesLoading
+            ? '正在读取微软朗读音色…'
+            : '无需 API Key；这是微软翻译客户端的演示接口，风格仅部分音色支持。' }}
+          <template v-if="msVoiceError">（{{ msVoiceError }}）</template>
+        </p>
+      </template>
+
+      <!-- 缓冲字符数：缓冲流按这个配额预合成音频，越大越不容易断档 -->
+      <div
+        v-if="usesBufferedSpeech"
+        class="setting-row slider-row"
+      >
+        <div class="slider-head">
+          <label>缓冲字符数</label>
+          <span class="slider-value">{{ store.speechConfig.bufferChars }} 字</span>
+        </div>
+        <input
+          class="settings-slider"
+          type="range"
+          :min="BUFFER_CHARS_MIN"
+          :max="BUFFER_CHARS_MAX"
+          step="100"
+          :value="store.speechConfig.bufferChars"
+          @input="store.setBufferChars(Number(($event.target as HTMLInputElement).value))"
+        >
+      </div>
+      <p
+        v-if="usesBufferedSpeech"
+        class="setting-hint"
+      >
+        自动朗读会提前合成约这么多字的音频再边播边补：调大更抗网络抖动，调小更省请求。
+      </p>
+
       <div class="setting-row setting-row-top">
         <label>朗读语速</label>
         <div class="stepper">
@@ -596,6 +1090,38 @@
           <button class="opt-btn" :class="{ active: store.speechConfig.stopAfterMinutes === 30 }" @click="store.setSpeechStopTimer(30)">30分钟</button>
           <button class="opt-btn" :class="{ active: store.speechConfig.stopAfterMinutes === 60 }" @click="store.setSpeechStopTimer(60)">60分钟</button>
           <button class="opt-btn" :class="{ active: store.speechConfig.stopAfterMinutes === 120 }" @click="store.setSpeechStopTimer(120)">120分钟</button>
+        </div>
+      </div>
+
+      <!-- 语音测试：用当前通道 / 音色 / 参数试听一段可编辑文本。
+           试听状态与书内朗读完全隔离（见 store.previewSpeech），绝不改 isSpeaking 等。 -->
+      <div class="setting-block speech-test">
+        <div class="setting-block-head">
+          <label>语音测试</label>
+          <span class="block-tag">当前通道：{{ store.speechProviderLabel }}</span>
+        </div>
+        <textarea
+          v-model="speechTestText"
+          class="speech-test-input"
+          rows="2"
+          maxlength="300"
+          placeholder="输入要试听的文本"
+        ></textarea>
+        <div class="speech-test-actions">
+          <button
+            v-if="store.isSpeechPreviewing"
+            class="opt-btn active"
+            type="button"
+            @click="store.stopSpeechPreview()"
+          >停止</button>
+          <button
+            v-else
+            class="opt-btn"
+            type="button"
+            :disabled="store.isSpeechPreviewLoading"
+            @click="store.previewSpeech(speechTestText)"
+          >{{ store.isSpeechPreviewLoading ? '生成中…' : '试听' }}</button>
+          <span class="speech-test-note">试听会先停止书内朗读；用当前音色与参数合成。</span>
         </div>
       </div>
       </section>
@@ -682,6 +1208,13 @@
       </div>
       </section>
     </div>
+
+    <!-- 引擎管理必须 Teleport 到 body：设置面板自身 overflow-y:auto，fixed 子元素
+         会被祖先的 overflow 裁掉（在抽屉里只剩一条缝）。 -->
+    <HttpTtsManager
+      v-if="showHttpTtsManager"
+      @close="handleHttpTtsManagerClosed"
+    />
   </div>
 </template>
 
@@ -696,7 +1229,25 @@ import {
   type SpeechAudioFormat,
 } from '../../utils/openaiSpeech'
 import { READER_FONT_SIZE_MAX, READER_FONT_SIZE_MIN } from '../../utils/readerFontSize'
+import { getHttpTtsList } from '../../api/httpTts'
+import { listEdgeTtsVoices, type EdgeTtsFormat, type EdgeTtsVoice } from '../../api/edgeTts'
+import { listMsTtsVoices, type MsTtsFormat, type MsTtsVoice } from '../../api/msTts'
+import HttpTtsManager from './HttpTtsManager.vue'
+import type { HttpTts } from '../../types'
 import {
+  BUFFER_CHARS_MAX,
+  BUFFER_CHARS_MIN,
+  EDGE_PITCH_MAX,
+  EDGE_PITCH_MIN,
+  EDGE_VOLUME_MAX,
+  EDGE_VOLUME_MIN,
+  MS_FORMATS,
+  MS_PITCH_MAX,
+  MS_PITCH_MIN,
+  MS_STYLE_DEGREE_MAX,
+  MS_STYLE_DEGREE_MIN,
+  MS_VOLUME_MAX,
+  MS_VOLUME_MIN,
   READER_PAGE_VERTICAL_PADDING_MAX,
   READER_PAGE_WIDTH_MAX,
   READER_PAGE_WIDTH_MIN,
@@ -734,7 +1285,25 @@ const readerSettingsTabs = [
   { value: 'speech', label: '朗读' },
   { value: 'more', label: '更多' },
 ] as const
-const activeSettingsTab = ref<(typeof readerSettingsTabs)[number]['value']>('display')
+
+/**
+ * 独立模式：从主设置抽屉打开「朗读与听书」时用。
+ *
+ * 此时没有阅读上下文, 只保留「朗读」页签 —— 「显示/翻页」调的是阅读页排版(没有
+ * 预览就没有意义), 「更多」里的离线缓存与净化入口又依赖阅读面板栈。这样主设置
+ * 与阅读页用的是同一份实现, 不会出现两套配置界面各自漂移。
+ */
+const props = withDefaults(defineProps<{ standalone?: boolean }>(), { standalone: false })
+const emit = defineEmits<{ close: [] }>()
+
+const visibleTabs = computed(() =>
+  props.standalone
+    ? readerSettingsTabs.filter((tab) => tab.value === 'speech')
+    : readerSettingsTabs,
+)
+const activeSettingsTab = ref<(typeof readerSettingsTabs)[number]['value']>(
+  props.standalone ? 'speech' : 'display',
+)
 const activeCustomFont = computed(() => {
   if (!config.value.fontFamily.startsWith('custom:')) return null
   const id = config.value.fontFamily.slice('custom:'.length)
@@ -1042,6 +1611,9 @@ function handleCaptureMouseUp(event: MouseEvent) {
 }
 
 onBeforeUnmount(() => {
+  // 关闭设置面板 / 离开阅读页：试听必须停下并回收 objectURL，否则声音会一直响
+  // 而用户已经没有入口关掉它（试听不挂在听书面板上）。
+  store.stopSpeechPreview()
   if (typeof window === 'undefined') return
   // 面板可能在录入途中被卸载(例如换章导致重渲染)。不清标志会让快捷键
   // 永久失效 —— 运行时的派发会被一个永远为真的「正在录入」挡住。
@@ -1164,8 +1736,229 @@ function handleVoiceChange(event: Event) {
   store.setVoiceName(target?.value || '')
 }
 
+/** 语音测试的示例文本：含引号，方便验证双音色与标点停顿。 */
+const speechTestText = ref('他推开门，看见她站在窗边。“你来了。”')
+
+/* ─── 在线朗读引擎（httpTTS） ─── */
+const httpTtsList = ref<HttpTts[]>([])
+const httpTtsLoading = ref(false)
+const showHttpTtsManager = ref(false)
+
+/** select 的 value 必须是字符串：存储里 id 可能是 number（后端下发）或 string。 */
+const selectedHttpTtsId = computed(() => (
+  store.speechConfig.httpTtsId == null ? '' : String(store.speechConfig.httpTtsId)
+))
+
+const selectedDialogueHttpTtsId = computed(() => (
+  store.speechConfig.dialogueHttpTtsId == null ? '' : String(store.speechConfig.dialogueHttpTtsId)
+))
+
+function syncHttpTtsSelection() {
+  const selected = httpTtsList.value.find((engine) => String(engine.id) === selectedHttpTtsId.value)
+  if (selected) {
+    // 列表里的 contentType 可能比配置里新（重新导入过引擎），补写一次做 MIME 兜底。
+    if (!store.speechConfig.httpTtsContentType && selected.contentType) {
+      store.setHttpTtsId(selected.id, selected.contentType)
+    }
+  } else if (httpTtsList.value.length) {
+    // 选中的引擎已被删除，或从未选过：列表非空时顺手选中第一个，省一次点击。
+    const first = httpTtsList.value[0]
+    store.setHttpTtsId(first.id, first.contentType || '')
+  } else if (store.speechConfig.httpTtsId != null) {
+    // 列表清空却还留着旧 id：必须清掉，否则 startTTS 会拿不存在的 id 去请求。
+    store.setHttpTtsId(null)
+  }
+
+  // 对话引擎不做「自动选第一个」：旁白/对话本就该是两个引擎，随便填一个会让
+  // 用户以为分音色生效了其实没换。只在它指向已删除引擎时清掉，回落到跟随旁白。
+  const dialogueExists = httpTtsList.value.some(
+    (engine) => String(engine.id) === selectedDialogueHttpTtsId.value,
+  )
+  if (!dialogueExists && store.speechConfig.dialogueHttpTtsId != null) {
+    store.setDialogueHttpTtsId(null)
+  }
+}
+
+async function loadHttpTtsList() {
+  httpTtsLoading.value = true
+  try {
+    httpTtsList.value = await getHttpTtsList()
+    syncHttpTtsSelection()
+  } catch (error) {
+    httpTtsList.value = []
+    appStore.showToast((error as Error).message || '读取在线朗读引擎失败', 'error')
+  } finally {
+    httpTtsLoading.value = false
+  }
+}
+
+function handleHttpTtsChange(event: Event) {
+  const value = (event.target as HTMLSelectElement | null)?.value || ''
+  const engine = httpTtsList.value.find((item) => String(item.id) === value)
+  store.setHttpTtsId(engine ? engine.id : null, engine?.contentType || '')
+}
+
+function handleDialogueHttpTtsChange(event: Event) {
+  const value = (event.target as HTMLSelectElement | null)?.value || ''
+  const engine = httpTtsList.value.find((item) => String(item.id) === value)
+  store.setDialogueHttpTtsId(engine ? engine.id : null, engine?.contentType || '')
+}
+
+function handleHttpTtsManagerClosed() {
+  showHttpTtsManager.value = false
+  // 管理面板里可能导入/删除了引擎，回到设置页必须刷新下拉与选中项。
+  void loadHttpTtsList()
+}
+
+/* ─── Edge 朗读 ─── */
+const edgeVoices = ref<EdgeTtsVoice[]>([])
+const edgeVoicesLoading = ref(false)
+const edgeVoiceError = ref('')
+/** 默认只列中文：后端返回 322 个音色，全列出来会把下拉淹没。 */
+const showAllEdgeLocales = ref(false)
+
+/** 哪些通道走缓冲流（缓冲字符数滑块只对它们有意义）。 */
+const usesBufferedSpeech = computed(() => {
+  const provider = store.speechConfig.provider
+  return provider === 'http' || provider === 'openai' || provider === 'edge' || provider === 'msdemo'
+})
+
+/** 当前筛选 + 已选音色（筛掉的也补进来，避免下拉因值不存在而显示空白）。 */
+const edgeVoiceOptions = computed(() => {
+  const all = edgeVoices.value
+  const filtered = showAllEdgeLocales.value
+    ? [...all]
+    : all.filter((voice) => voice.locale.toLowerCase().startsWith('zh-cn'))
+  for (const shortName of [store.speechConfig.edgeVoice, store.speechConfig.edgeDialogueVoice]) {
+    if (!shortName) continue
+    if (filtered.some((voice) => voice.shortName === shortName)) continue
+    const selected = all.find((voice) => voice.shortName === shortName)
+    if (selected) filtered.push(selected)
+  }
+  return filtered
+})
+
+function edgeVoiceLabel(voice: EdgeTtsVoice) {
+  // 中文音色的 friendlyName 已经足够可读；显示全部语言时补 locale，避免同名混淆。
+  const name = voice.friendlyName || voice.shortName
+  return showAllEdgeLocales.value ? `${name} · ${voice.locale}` : name
+}
+
+async function loadEdgeTtsVoices() {
+  if (edgeVoices.value.length || edgeVoicesLoading.value) return
+  edgeVoicesLoading.value = true
+  edgeVoiceError.value = ''
+  try {
+    edgeVoices.value = await listEdgeTtsVoices()
+  } catch (error) {
+    // 音色列表拉不到不该阻断其它通道：保留默认音色，只提示一行可读错误。
+    edgeVoiceError.value = (error as Error).message || '读取 Edge 音色失败'
+    appStore.showToast(edgeVoiceError.value, 'error')
+  } finally {
+    edgeVoicesLoading.value = false
+  }
+}
+
+/* ─── 微软朗读 ─── */
+const msVoices = ref<MsTtsVoice[]>([])
+const msVoicesLoading = ref(false)
+const msVoiceError = ref('')
+/** 958 个音色全列会淹没选择：默认只列 zh-CN，可切「显示全部语言」。 */
+const showAllMsLocales = ref(false)
+
+function msVoiceStyles(shortName: string): string[] {
+  const voice = msVoices.value.find((item) => item.shortName === shortName)
+  // 后端 styles 可能为空/含空串：过滤掉，避免下拉出现空白项。
+  return (voice?.styles || []).filter((style) => typeof style === 'string' && style.trim())
+}
+
+/** 旁白可选风格 = 当前旁白音色自带的风格。 */
+const msStyleOptions = computed(() => msVoiceStyles(store.speechConfig.msVoice))
+/** 对话可选风格 = 对话音色（未选时跟随旁白音色）自带的风格。 */
+const msDialogueStyleOptions = computed(() => (
+  msVoiceStyles(store.speechConfig.msDialogueVoice || store.speechConfig.msVoice)
+))
+
+/** 风格强度是共享参数：只要旁白或（双音色时）对话任一方有风格就显示一次。 */
+const showMsStyleDegree = computed(() => (
+  store.speechConfig.dualVoiceEnabled
+    ? Boolean(store.speechConfig.msStyle || store.speechConfig.msDialogueStyle)
+    : Boolean(store.speechConfig.msStyle)
+))
+
+/** 当前筛选 + 已选音色（筛掉的也补进来，避免下拉因值不存在而显示空白）。 */
+const msVoiceOptions = computed(() => {
+  const all = msVoices.value
+  const filtered = showAllMsLocales.value
+    ? [...all]
+    : all.filter((voice) => voice.locale.toLowerCase().startsWith('zh-cn'))
+  for (const shortName of [store.speechConfig.msVoice, store.speechConfig.msDialogueVoice]) {
+    if (!shortName) continue
+    if (filtered.some((voice) => voice.shortName === shortName)) continue
+    const selected = all.find((voice) => voice.shortName === shortName)
+    if (selected) filtered.push(selected)
+  }
+  return filtered
+})
+
+function msVoiceLabel(voice: MsTtsVoice) {
+  const name = voice.friendlyName || voice.shortName
+  return showAllMsLocales.value ? `${name} · ${voice.locale}` : name
+}
+
+/**
+ * 音色切换后，旧风格可能不在新音色的 StyleList 里 —— 此时回落到「无风格」，
+ * 否则会把一个该音色不支持的 style 发给服务端（多半直接报错或静默失效）。
+ */
+function syncMsStyles() {
+  if (!msVoices.value.length) return
+  if (store.speechConfig.msStyle && !msStyleOptions.value.includes(store.speechConfig.msStyle)) {
+    store.setMsStyle('')
+  }
+  const dialogueStyle = store.speechConfig.msDialogueStyle
+  if (dialogueStyle && !msDialogueStyleOptions.value.includes(dialogueStyle)) {
+    store.setMsDialogueStyle('')
+  }
+}
+
+async function loadMsTtsVoices() {
+  if (msVoices.value.length || msVoicesLoading.value) return
+  msVoicesLoading.value = true
+  msVoiceError.value = ''
+  try {
+    msVoices.value = await listMsTtsVoices()
+    syncMsStyles()
+  } catch (error) {
+    // 音色列表拉不到不该阻断其它通道：保留默认音色，只提示一行可读错误。
+    msVoiceError.value = (error as Error).message || '读取微软朗读音色失败'
+    appStore.showToast(msVoiceError.value, 'error')
+  } finally {
+    msVoicesLoading.value = false
+  }
+}
+
+watch(() => store.speechConfig.msVoice, () => syncMsStyles())
+watch(() => store.speechConfig.msDialogueVoice, () => syncMsStyles())
+
+// 切到在线朗读引擎 / Edge / 微软朗读时才拉列表：绝大多数用户用系统语音，不该多发 IPC。
+watch(() => store.speechConfig.provider, (provider) => {
+  // 试听用的是「当前通道」，切通道后旧试听的声音已经对不上配置，直接停掉。
+  store.stopSpeechPreview()
+  if (provider === 'http' && !httpTtsList.value.length) void loadHttpTtsList()
+  if (provider === 'edge') void loadEdgeTtsVoices()
+  if (provider === 'msdemo') void loadMsTtsVoices()
+})
+
+// 离开「朗读」页签时试听按钮已不可见，继续出声会变成关不掉的声音。
+watch(activeSettingsTab, (tab) => {
+  if (tab !== 'speech') store.stopSpeechPreview()
+})
+
 onMounted(async () => {
   store.fetchVoices()
+  if (store.speechConfig.provider === 'http') void loadHttpTtsList()
+  if (store.speechConfig.provider === 'edge') void loadEdgeTtsVoices()
+  if (store.speechConfig.provider === 'msdemo') void loadMsTtsVoices()
 })
 </script>
 
@@ -1319,6 +2112,19 @@ onMounted(async () => {
   gap: 10px;
 }
 
+/* 旁白/对话两个独立分区：带边框与浅底，避免两行音色挤在一起。 */
+.voice-partition {
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--settings-font, currentColor) 14%, transparent);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--settings-font, currentColor) 3.5%, transparent);
+}
+
+.voice-partition .setting-block-head label {
+  font-weight: 600;
+  opacity: 0.82;
+}
+
 .setting-block-head {
   display: flex;
   align-items: center;
@@ -1330,6 +2136,46 @@ onMounted(async () => {
   font-size: 14px;
   font-weight: 500;
   opacity: 0.7;
+}
+
+/* ─── 语音测试 ─── */
+.speech-test-input {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 56px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--settings-field-border);
+  background: var(--settings-field-bg);
+  color: inherit;
+  font: inherit;
+  line-height: 1.6;
+  resize: vertical;
+  outline: none;
+  transition: background 0.18s, border-color 0.18s, box-shadow 0.18s;
+}
+
+.speech-test-input:focus {
+  background: var(--settings-field-bg-hover);
+  border-color: var(--color-primary, #c97f3a);
+  box-shadow: 0 0 0 3px rgba(201, 127, 58, 0.16);
+}
+
+.speech-test-input::placeholder {
+  color: var(--settings-field-placeholder);
+}
+
+.speech-test-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.speech-test-note {
+  font-size: 12px;
+  line-height: 1.5;
+  opacity: 0.6;
 }
 
 .link-btn {
@@ -1798,6 +2644,16 @@ onMounted(async () => {
   color-scheme: dark;
 }
 
+/* 在线朗读引擎 / Edge：下拉占满剩余宽度，右侧按钮靠右同排 */
+.http-tts-picker,
+.edge-voice-picker {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .setting-hint {
   margin-top: -8px;
   padding-left: 90px;
@@ -1923,18 +2779,49 @@ onMounted(async () => {
   overflow: hidden;
 }
 
-/* Sliders */
+/* Sliders
+ *
+ * 行结构是「.slider-head(标签 + 数值 + 可选回正按钮) + input[range]」。
+ * 早先用 flex-column + space-between，滑块收窄到 240px 后数值会被顶到整行最右，
+ * 和滑块之间空出一大截、看着像两个不相干的东西。
+ * 这里改成 grid 并把整组居中：标签（定宽右对齐，保证各行左边界一致）/ 滑块 /
+ * 数值 / 回正 排成一行，数值紧跟滑块右端，整体在面板里水平居中。
+ * 用 display:contents 把 .slider-head 拆掉，避免改 11 处模板标记。 */
 .slider-row {
-  flex-direction: column;
-  align-items: stretch;
-  gap: 8px;
+  display: grid;
+  grid-template-columns: 96px minmax(120px, 240px) 56px 64px;
+  align-items: center;
+  justify-content: center;
+  column-gap: 10px;
+  row-gap: 4px;
 }
 
 .slider-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 12px;
+  display: contents;
+}
+
+.slider-row .slider-head > label {
+  grid-column: 1;
+  /* 右对齐：标签长短不一（「音调」/「缓冲字符数」）时滑块左端仍整齐。 */
+  text-align: right;
+}
+
+.slider-row > .settings-slider {
+  grid-column: 2;
+  width: 100%;
+}
+
+.slider-row .slider-head > .slider-value {
+  grid-column: 3;
+  /* 定宽 + 右对齐：数值位数变化时滑块不会左右抖动。 */
+  min-width: 52px;
+  text-align: right;
+  justify-self: start;
+}
+
+.slider-row .slider-head > .link-btn {
+  grid-column: 4;
+  justify-self: start;
 }
 
 .slider-value {
@@ -1944,7 +2831,9 @@ onMounted(async () => {
 }
 
 .settings-slider {
-  width: 100%;
+  /* 宽面板上 100% 会拉到整行、拖动手感差；统一收窄到 240px（窄屏仍可缩）。
+     数值由上面的 grid 紧跟滑块右侧，不再靠整行 right。 */
+  width: min(240px, 100%);
   appearance: none;
   -webkit-appearance: none;
   height: 18px;
@@ -2083,6 +2972,11 @@ onMounted(async () => {
 
   .voice-select {
     width: auto;
+  }
+
+  .http-tts-picker,
+  .edge-voice-picker {
+    flex-wrap: wrap;
   }
 
   .setting-hint {

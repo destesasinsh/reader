@@ -131,7 +131,38 @@ onMounted(() => {
 })
 
 let closeUnlisten: (() => void) | undefined
+let legadoUnlisten: (() => void) | undefined
 let handlingCloseRequest = false
+
+/**
+ * 处理 `legado://` 一键导入。
+ *
+ * 冷启动（网页按钮直接拉起应用）时 URL 在启动参数里，桌面壳先暂存，这里挂载后
+ * 主动来取；应用已在运行时被再次唤起，则由 shell 发 `legado-deeplink` 事件通知。
+ * 两种情况都走同一个"取暂存 → 导入"流程。
+ */
+async function consumePendingLegadoDeepLink() {
+  const { invokeEnvelope } = await import('./api/invoke')
+  const url = await invokeEnvelope<string | null>('take_pending_legado_deeplink', {})
+  if (!url) return
+  const { importFromLegadoDeepLink } = await import('./utils/legadoImport')
+  try {
+    const result = await importFromLegadoDeepLink(url)
+    appStore.showToast(result.message, result.type)
+  } catch (error) {
+    appStore.showToast((error as Error).message || '一键导入失败', 'error')
+  }
+}
+
+onMounted(() => {
+  if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) return
+  void consumePendingLegadoDeepLink()
+  listen('legado-deeplink', () => {
+    void consumePendingLegadoDeepLink()
+  }).then((un) => {
+    legadoUnlisten = un
+  })
+})
 
 /** 关闭窗口前的收尾: 把阅读位置落到书架。
  *
@@ -178,6 +209,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   closeUnlisten?.()
+  legadoUnlisten?.()
   stopBackgroundClassSync()
   if (typeof document !== 'undefined') {
     document.body.classList.remove('custom-background-active')

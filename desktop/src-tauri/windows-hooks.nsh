@@ -205,4 +205,26 @@
   ; Keep a product-name-independent record. Future releases can find the
   ; install directory even if PRODUCTNAME changes again.
   WriteRegStr SHCTX "${READER_STABLE_MANUPRODUCTKEY}" "" "$INSTDIR"
+
+  ; 注册 legado:// 协议，让书源站点的「一键导入」能唤起本应用。
+  ;
+  ; 为什么不用 tauri-plugin-deep-link：那个插件主要服务 macOS/Linux 的 bundle
+  ; 配置，Windows 上照样要写这些注册表项；本仓库已有自定义 NSIS 模板与 hook，
+  ; 直接在这里注册少一层依赖，也能精确控制卸载时的清理条件。
+  ;
+  ; 只有**安装版**会注册 —— 便携包解压即用、不经过安装器，自然没有协议归属；
+  ; 同一个协议也只能指向一个 exe（后安装的会覆盖先安装的）。
+  WriteRegStr SHCTX "Software\Classes\legado" "URL Protocol" ""
+  WriteRegStr SHCTX "Software\Classes\legado" "" "URL:Legado import protocol"
+  WriteRegStr SHCTX "Software\Classes\legado\DefaultIcon" "" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\",0"
+  WriteRegStr SHCTX "Software\Classes\legado\shell\open\command" "" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\" $\"%1$\""
+!macroend
+
+!macro NSIS_HOOK_POSTUNINSTALL
+  ; 只删仍然指向本安装目录的那份注册，避免把用户后来装的其它客户端（或者另一个
+  ; 副本）的协议注册一并抹掉。
+  ReadRegStr $R7 SHCTX "Software\Classes\legado\shell\open\command" ""
+  ${If} $R7 == "$\"$INSTDIR\${MAINBINARYNAME}.exe$\" $\"%1$\""
+    DeleteRegKey SHCTX "Software\Classes\legado"
+  ${EndIf}
 !macroend

@@ -37,6 +37,8 @@ test-results/
 # Debug scratch files
 toc_tmp.html
 *.tmp.html
+# 测试用的可写 TEMP（本机 %TEMP% 被组策略挡住时，见 CLAUDE.md）
+.cargo-tmp/
 .ace-tool/
 
 # 本地探针/取证临时目录（下载的书源 JSON、抓取页面、一次性 Rust 探针等，不入库）

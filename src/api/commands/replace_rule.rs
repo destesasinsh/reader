@@ -146,3 +146,61 @@ where
         list.push(item);
     }
 }
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyReplaceRulesParam {
+    pub text: String,
+    pub rules: Vec<crate::parser::replace_rule_js::ReplaceRuleStep>,
+}
+
+/// 整条规则链的执行结果（含 `@js:` 脚本规则）。
+///
+/// 为什么放后端：脚本要在 rquickjs 沙盒里跑，不能进渲染进程（见
+/// `parser::replace_rule_js` 的说明）。前端只在**存在脚本规则**时才走这条命令，
+/// 纯正则/字面量规则仍走本地同步快路径，避免每章都多一次 IPC。
+///
+/// 纯计算、不依赖 `AppState`，所以 core 不带 state —— Web 端若将来要在浏览器里
+/// 执行脚本规则，可以直接复用这个 core，不必再复制一份实现。
+pub async fn apply_replace_rules_core(
+    req: ApplyReplaceRulesParam,
+) -> Result<ApiResponse<String>, AppError> {
+    let ApplyReplaceRulesParam { text, rules } = req;
+    if rules.len() > MAX_REPLACE_SCRIPT_RULES {
+        return Err(AppError::BadRequest(format!(
+            "净化规则数量超出上限（{} 条）",
+            MAX_REPLACE_SCRIPT_RULES
+        )));
+    }
+
+    // 脚本是用户从网上导入的，可能写出死循环。放到阻塞线程池里执行并设上限，
+    // 最坏情况只损失一个后台线程和这一章的净化结果，不会拖住整个 IPC 运行时而卡死界面。
+    let handle = tokio::task::spawn_blocking(move || {
+        crate::parser::replace_rule_js::apply_rules(&text, &rules)
+    });
+
+    match tokio::time::timeout(REPLACE_SCRIPT_TIMEOUT, handle).await {
+        Ok(Ok(Ok(output))) => Ok(ApiResponse::ok(output)),
+        Ok(Ok(Err(message))) => Err(AppError::BadRequest(message)),
+        Ok(Err(join_error)) => Err(AppError::BadRequest(format!(
+            "净化脚本线程异常: {join_error}"
+        ))),
+        Err(_) => Err(AppError::BadRequest(
+            "净化脚本执行超时，可能存在死循环，已跳过本章净化".to_string(),
+        )),
+    }
+}
+
+/// 单章规则条数上限：正常规则集是几十条，几百条已属异常，防止一次 IPC 塞爆。
+const MAX_REPLACE_SCRIPT_RULES: usize = 500;
+
+/// 单章脚本执行上限。正常整章处理在毫秒级，超过这个量级基本可以判定是死循环。
+const REPLACE_SCRIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// `apply_replace_rules` 的 Tauri 入口: 只是 core 的薄壳。
+#[tauri::command]
+pub async fn apply_replace_rules(
+    req: ApplyReplaceRulesParam,
+) -> Result<ApiResponse<String>, AppError> {
+    apply_replace_rules_core(req).await
+}

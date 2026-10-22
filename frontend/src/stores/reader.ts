@@ -18,7 +18,7 @@ import {
   deleteBookmark as apiDeleteBookmark,
   deleteBookmarks as apiDeleteBookmarks,
 } from '../api/bookmark'
-import { getReplaceRules } from '../api/replaceRule'
+import { applyReplaceRulesInSandbox, getReplaceRules, type SandboxReplaceRuleStep } from '../api/replaceRule'
 import type { Book, BookChapter, Bookmark, ReplaceRule } from '../types'
 import { isLocalBook } from '../utils/localBook'
 import { PDF_PAGE_ATTR } from '../utils/pdfPages'
@@ -55,7 +55,12 @@ import {
 } from '../api/webdav'
 import { deleteCustomFont, listCustomFonts, uploadCustomFont, type CustomFontEntry } from '../api/fonts'
 import { deleteBackgroundImage } from '../api/background'
+import { normalizeAudioContentType, synthesizeHttpTts } from '../api/httpTts'
+import { synthesizeEdgeTts, type EdgeTtsFormat } from '../api/edgeTts'
+import { synthesizeMsTts, type MsTtsFormat } from '../api/msTts'
+import { splitSpeechSegments, type SpeechSegment, type SpeechSegmentType } from '../utils/speechSegments'
 import { readSavedReadingPosition } from '../utils/readingPosition'
+import { compileReplaceRule, toSandboxRuleStep } from '../utils/replaceRuleRegex'
 
 const READER_SESSION_KEY = 'reader-last-session'
 const READER_READ_HISTORY_PREFIX = 'reader-read-history:'
@@ -284,6 +289,16 @@ interface PreloadedOpenAIAudio {
   blob: Blob
 }
 
+/**
+ * 缓冲流句柄：由 useReaderAutoPlayback 创建 SpeechStream 时注册进 store，
+ * 让暂停/停止按钮能作用到流自己的 <audio>（而不是 store 里那套单段播放器）。
+ */
+export interface SpeechStreamControls {
+  pause: () => void
+  resume: () => void
+  stop: () => void
+}
+
 const OPENAI_AUDIO_PRELOAD_LIMIT = 8
 
 /** 复用在途预载时的加载动画延迟。命中预载本该是"瞬间换章", 200ms 内返回就完全
@@ -303,7 +318,20 @@ function normalizeOptionalUrl(value?: string | null): string | undefined {
   return trimmed ? trimmed : undefined
 }
 
-export type SpeechProvider = 'system' | 'openai'
+/**
+ * 朗读引擎。
+ *
+ * `'http'` 指 Legado 的「在线朗读引擎」（httpTTS）：URL 模板由后端展开，前端
+ * 只把正文和语速交过去，收回来的就是一段完整音频 —— 所以它和 `'openai'`
+ * 共用同一套 HTMLAudioElement 播放器，而不是复用系统语音。
+ *
+ * `'edge'` 是 Edge 朗读（edge-tts）：后端走微软的在线语音服务拿 mp3，同样
+ * 一段文本一段音频，因此也复用 HTMLAudioElement 播放器与缓冲流。
+ *
+ * `'msdemo'` 是「微软朗读」（微软翻译客户端演示接口）：同样是一段文本一段 mp3，
+ * 额外支持风格 style / 风格强度，也走 HTMLAudioElement 播放器与缓冲流。
+ */
+export type SpeechProvider = 'system' | 'openai' | 'http' | 'edge' | 'msdemo'
 export type OpenAISpeechSource = 'browser' | 'server'
 export type OpenAISpeechFormat = SpeechAudioFormat
 export type OpenAISpeechRequestMode = 'chunked' | 'merged'
@@ -323,6 +351,194 @@ interface SpeechConfig {
   openaiVoice: string
   openaiFormat: OpenAISpeechFormat
   openaiRequestMode: OpenAISpeechRequestMode
+  /** 选中的在线朗读引擎 id，null 表示尚未选择。 */
+  httpTtsId: number | string | null
+  /** 选中引擎声明的 contentType，仅作音频 MIME 嗅探失败时的兜底。 */
+  httpTtsContentType: string
+  /** 旁白/对话分音色开关。关闭时下面 5 个字段仍保留（切换回来不用重选）。 */
+  dualVoiceEnabled: boolean
+  /** 系统语音的对话音色名；空串表示跟随旁白音色。 */
+  dialogueVoiceName: string
+  /** API 语音的对话音色；空串表示跟随旁白音色。 */
+  dialogueOpenaiVoice: string
+  /** 在线朗读引擎的对话引擎 id；null 表示跟随旁白引擎。 */
+  dialogueHttpTtsId: number | string | null
+  dialogueHttpTtsContentType: string
+  /** Edge 朗读的旁白音色 shortName，默认云希（男声，适合旁白）。 */
+  edgeVoice: string
+  /** Edge 朗读的对话音色；空串表示跟随 `edgeVoice`。 */
+  edgeDialogueVoice: string
+  /** Edge 音调偏移（Hz），-100..100，默认 0（不偏移）。 */
+  edgePitch: number
+  /** Edge 音量偏移（%），-100..100，默认 0（不偏移）。 */
+  edgeVolume: number
+  /** Edge 音质：48k（默认，省流量）/ 96k（音质更好，字节数约为 2 倍）。 */
+  edgeFormat: EdgeTtsFormat
+  /** 微软朗读的旁白音色 shortName，默认云健（男声，适合旁白）。 */
+  msVoice: string
+  /** 微软朗读的对话音色；空串表示跟随 `msVoice`。 */
+  msDialogueVoice: string
+  /** 微软朗读的旁白风格（来自音色的 StyleList）；空串表示无风格。 */
+  msStyle: string
+  /** 微软朗读的对话风格；空串表示跟随旁白风格。 */
+  msDialogueStyle: string
+  /** 风格强度 0.5–2.0（默认 1.0，仅在有风格时生效）。 */
+  msStyleDegree: number
+  /** 音调偏移（%），-50..50，默认 0。注意这个通道的 pitch 是百分比而非 Hz。 */
+  msPitch: number
+  /** 音量偏移（%），-100..100，默认 0。 */
+  msVolume: number
+  /** 音质：48k / 96k（默认）/ 192k。 */
+  msFormat: MsTtsFormat
+  /**
+   * 缓冲流的目标字符数（就绪未播 + 在途）：越大越不容易断档，代价是更早的
+   * 网络请求与更多内存。只影响自动朗读的 http / openai / edge / msdemo 通道。
+   */
+  bufferChars: number
+}
+
+/** Edge 朗读的默认旁白音色：云希（zh-CN-YunxiNeural），男声，适合旁白。 */
+export const DEFAULT_EDGE_VOICE = 'zh-CN-YunxiNeural'
+/** Edge 音调 / 音量的取值范围（后端 SSML 支持 -100..100）。 */
+export const EDGE_PITCH_MIN = -100
+export const EDGE_PITCH_MAX = 100
+export const EDGE_VOLUME_MIN = -100
+export const EDGE_VOLUME_MAX = 100
+/** Edge 边读端点只接受这两种 outputFormat；默认 48k（省流量）。 */
+export const DEFAULT_EDGE_FORMAT: EdgeTtsFormat = '48k'
+
+/** 微软朗读的默认旁白音色：云健（zh-CN-YunjianNeural），男声，适合旁白。 */
+export const DEFAULT_MS_VOICE = 'zh-CN-YunjianNeural'
+/** 微软朗读只支持三种音质档位；默认 96k（这个通道的音质档位是它的优势）。 */
+export const DEFAULT_MS_FORMAT: MsTtsFormat = '96k'
+export const MS_FORMATS: MsTtsFormat[] = ['48k', '96k', '192k']
+/** 风格强度 / 音调 / 音量的取值范围。 */
+export const MS_STYLE_DEGREE_MIN = 0.5
+export const MS_STYLE_DEGREE_MAX = 2
+export const MS_PITCH_MIN = -50
+export const MS_PITCH_MAX = 50
+export const MS_VOLUME_MIN = -100
+export const MS_VOLUME_MAX = 100
+
+/** 缓冲字符数的默认值与取值范围。 */
+export const DEFAULT_BUFFER_CHARS = 500
+export const BUFFER_CHARS_MIN = 200
+export const BUFFER_CHARS_MAX = 2000
+
+/**
+ * 引擎 id 归一化：后端 id 是毫秒时间戳（number），旧配置/手写配置可能是字符串。
+ * 0 与空串都表示「未选择」——保存时后端会给 0 补发新 id，拿 0 去请求只会找不到。
+ */
+function normalizeHttpTtsId(value: unknown): number | string | null {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) && value !== 0 ? value : null
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    return trimmed && trimmed !== '0' ? trimmed : null
+  }
+  return null
+}
+
+/** 缓冲字符数归一化：非数字回默认值，数字夹到 [200, 2000] 并取整。 */
+function normalizeBufferChars(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_BUFFER_CHARS
+  return Math.min(BUFFER_CHARS_MAX, Math.max(BUFFER_CHARS_MIN, Math.round(value)))
+}
+
+/** Edge 旁白音色归一化：空/非字符串都回默认音色，避免下拉显示空白且发不出请求。 */
+function normalizeEdgeVoice(value: unknown): string {
+  return typeof value === 'string' && value.trim() ? value.trim() : DEFAULT_EDGE_VOICE
+}
+
+/** Edge 对话音色归一化：空串是合法值（表示跟随旁白），非字符串一律当空。 */
+function normalizeEdgeDialogueVoice(value: unknown): string {
+  return typeof value === 'string' && value.trim() ? value.trim() : ''
+}
+
+/** Edge 音调/音量归一化：非数字回 0，数字夹到 [-100, 100] 并取整。 */
+function normalizeEdgeSignedLevel(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 0
+  return Math.min(100, Math.max(-100, Math.round(value)))
+}
+
+/**
+ * Edge 音质归一化：服务端只接受 48k / 96k 两档，其它历史脏值一律回默认 48k
+ * （宁可退回标准音质，也不要带着非法 outputFormat 让合成整个失败）。
+ */
+function normalizeEdgeFormat(value: unknown): EdgeTtsFormat {
+  return value === '96k' ? '96k' : DEFAULT_EDGE_FORMAT
+}
+
+/** 微软朗读旁白音色归一化：空/非字符串回默认音色。 */
+function normalizeMsVoice(value: unknown): string {
+  return typeof value === 'string' && value.trim() ? value.trim() : DEFAULT_MS_VOICE
+}
+
+/** 微软朗读对话音色归一化：空串是合法值（跟随旁白）。 */
+function normalizeMsDialogueVoice(value: unknown): string {
+  return typeof value === 'string' && value.trim() ? value.trim() : ''
+}
+
+/** 风格名归一化：空/非字符串都当「无风格」。 */
+function normalizeMsStyle(value: unknown): string {
+  return typeof value === 'string' && value.trim() ? value.trim() : ''
+}
+
+/**
+ * 风格强度归一化：夹到 0.5–2.0 并保留一位小数（服务端按 0.1 步进理解）。
+ * 非数字回默认 1.0。
+ */
+function normalizeMsStyleDegree(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 1
+  const clamped = Math.min(MS_STYLE_DEGREE_MAX, Math.max(MS_STYLE_DEGREE_MIN, value))
+  return Math.round(clamped * 10) / 10
+}
+
+/** 微软朗读音调/音量归一化：非数字回 0，按各自范围取整夹紧。 */
+function normalizeMsLevel(value: unknown, min: number, max: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 0
+  return Math.min(max, Math.max(min, Math.round(value)))
+}
+
+/** 微软朗读音质归一化：只接受 48k/96k/192k，其它（含脏值）回默认 96k。 */
+function normalizeMsFormat(value: unknown): MsTtsFormat {
+  return MS_FORMATS.includes(value as MsTtsFormat) ? value as MsTtsFormat : DEFAULT_MS_FORMAT
+}
+
+/** 带符号百分比（微软朗读的 rate/pitch/volume 都是百分比串，0 写 `+0%`）。 */
+export function formatMsPercent(percent: number): string {
+  const value = Number.isFinite(percent) ? Math.round(percent) : 0
+  return value >= 0 ? `+${value}%` : `${value}%`
+}
+
+/**
+ * 倍速 → Edge 的 rate 参数（带符号百分比）。
+ *
+ * edge-tts 的 rate 是「相对默认语速的百分比」，如 `-20%`、`+15%`；我们的
+ * `speechRate` 是倍速（1 = 正常）。必须显式带 `+`：后端按 `+N%`/`-N%` 解析，
+ * 丢符号会被当成非法参数。0 也要写成 `+0%`。
+ */
+export function formatEdgeRate(speechRate: number): string {
+  const rate = Number.isFinite(speechRate) ? speechRate : 1
+  const delta = Math.round((rate - 1) * 100)
+  return delta >= 0 ? `+${delta}%` : `${delta}%`
+}
+
+/**
+ * 音调偏移 → Edge 的 pitch 参数（带符号 Hz）。
+ *
+ * 与 rate 同理：SSML 属性要求显式符号，0 必须写成 `+0Hz` 而不是 `0Hz`。
+ */
+export function formatEdgePitch(pitchHz: number): string {
+  const value = Number.isFinite(pitchHz) ? Math.round(pitchHz) : 0
+  return value >= 0 ? `+${value}Hz` : `${value}Hz`
+}
+
+/** 音量偏移 → Edge 的 volume 参数（带符号百分比）。 */
+export function formatEdgeVolume(volumePercent: number): string {
+  const value = Number.isFinite(volumePercent) ? Math.round(volumePercent) : 0
+  return value >= 0 ? `+${value}%` : `${value}%`
 }
 
 const defaultSpeechConfig: SpeechConfig = {
@@ -340,6 +556,27 @@ const defaultSpeechConfig: SpeechConfig = {
   openaiVoice: 'vivian',
   openaiFormat: 'mp3',
   openaiRequestMode: 'chunked',
+  httpTtsId: null,
+  httpTtsContentType: '',
+  dualVoiceEnabled: false,
+  dialogueVoiceName: '',
+  dialogueOpenaiVoice: '',
+  dialogueHttpTtsId: null,
+  dialogueHttpTtsContentType: '',
+  edgeVoice: DEFAULT_EDGE_VOICE,
+  edgeDialogueVoice: '',
+  edgePitch: 0,
+  edgeVolume: 0,
+  edgeFormat: DEFAULT_EDGE_FORMAT,
+  msVoice: DEFAULT_MS_VOICE,
+  msDialogueVoice: '',
+  msStyle: '',
+  msDialogueStyle: '',
+  msStyleDegree: 1,
+  msPitch: 0,
+  msVolume: 0,
+  msFormat: DEFAULT_MS_FORMAT,
+  bufferChars: DEFAULT_BUFFER_CHARS,
 }
 
 function loadSpeechConfig(): SpeechConfig {
@@ -350,7 +587,68 @@ function loadSpeechConfig(): SpeechConfig {
       const apiFormat = ['openai', 'fish', 'elevenlabs', 'azure'].includes(parsed.apiFormat || '')
         ? parsed.apiFormat as SpeechApiFormat
         : inferSpeechApiFormat(parsed.openaiBaseUrl || defaultSpeechConfig.openaiBaseUrl)
-      return { ...defaultSpeechConfig, ...parsed, apiFormat }
+      // 必须逐字段显式归一化：`{ ...默认值, ...parsed }` 只能补「缺失的 key」，
+      // 补不住「key 存在但值非法」。老配置只有两态 provider、没有 httpTtsId，
+      // 手工改坏的 localStorage 也可能带脏值，这里统一收回合法取值域，
+      // 否则 http 分支会带着不存在的 id 去请求后端，用户只看到一句「引擎不存在」。
+      const provider: SpeechProvider = parsed.provider === 'openai'
+        || parsed.provider === 'http'
+        || parsed.provider === 'edge'
+        || parsed.provider === 'msdemo'
+        ? parsed.provider
+        : 'system'
+      const httpTtsId = normalizeHttpTtsId(parsed.httpTtsId)
+      // 只接受音频类型：这个值最终会作为 Blob.type，脏值会让 <audio> 直接 fail。
+      const httpTtsContentType = normalizeAudioContentType(parsed.httpTtsContentType)
+      // 双音色字段同样是「值存在但可能非法」：布尔必须是 true 才算开启。
+      const dualVoiceEnabled = parsed.dualVoiceEnabled === true
+      const dialogueVoiceName = typeof parsed.dialogueVoiceName === 'string' ? parsed.dialogueVoiceName : ''
+      const dialogueOpenaiVoice = typeof parsed.dialogueOpenaiVoice === 'string' ? parsed.dialogueOpenaiVoice : ''
+      const dialogueHttpTtsId = normalizeHttpTtsId(parsed.dialogueHttpTtsId)
+      const dialogueHttpTtsContentType = normalizeAudioContentType(parsed.dialogueHttpTtsContentType)
+      // 缓冲字符数越界会让缓冲流要么白等、要么一次预取整章，必须夹回区间。
+      const bufferChars = normalizeBufferChars(parsed.bufferChars)
+      const edgeVoice = normalizeEdgeVoice(parsed.edgeVoice)
+      const edgeDialogueVoice = normalizeEdgeDialogueVoice(parsed.edgeDialogueVoice)
+      // 音调/音量是 SSML 参数：越界会让后端生成失败，脏值必须夹回 -100..100。
+      const edgePitch = normalizeEdgeSignedLevel(parsed.edgePitch)
+      const edgeVolume = normalizeEdgeSignedLevel(parsed.edgeVolume)
+      const edgeFormat = normalizeEdgeFormat(parsed.edgeFormat)
+      const msVoice = normalizeMsVoice(parsed.msVoice)
+      const msDialogueVoice = normalizeMsDialogueVoice(parsed.msDialogueVoice)
+      const msStyle = normalizeMsStyle(parsed.msStyle)
+      const msDialogueStyle = normalizeMsStyle(parsed.msDialogueStyle)
+      const msStyleDegree = normalizeMsStyleDegree(parsed.msStyleDegree)
+      const msPitch = normalizeMsLevel(parsed.msPitch, MS_PITCH_MIN, MS_PITCH_MAX)
+      const msVolume = normalizeMsLevel(parsed.msVolume, MS_VOLUME_MIN, MS_VOLUME_MAX)
+      const msFormat = normalizeMsFormat(parsed.msFormat)
+      return {
+        ...defaultSpeechConfig,
+        ...parsed,
+        apiFormat,
+        provider,
+        httpTtsId,
+        httpTtsContentType,
+        dualVoiceEnabled,
+        dialogueVoiceName,
+        dialogueOpenaiVoice,
+        dialogueHttpTtsId,
+        dialogueHttpTtsContentType,
+        edgeVoice,
+        edgeDialogueVoice,
+        edgePitch,
+        edgeVolume,
+        edgeFormat,
+        msVoice,
+        msDialogueVoice,
+        msStyle,
+        msDialogueStyle,
+        msStyleDegree,
+        msPitch,
+        msVolume,
+        msFormat,
+        bufferChars,
+      }
     }
   } catch { /* ignore */ }
   return { ...defaultSpeechConfig }
@@ -401,6 +699,13 @@ export const useReaderStore = defineStore('reader', () => {
   const bookLoadError = ref('')
   const bookmarks = ref<Bookmark[]>([])
   const replaceRules = ref<ReplaceRule[]>([])
+  /**
+   * 执行失败的净化规则: 规则名 → 错误信息。
+   *
+   * Legado 规则是 Java 正则, 少数写法在 JS 里没有等价物; 这些规则导入时是"成功"的,
+   * 但每次应用都会失败。收集起来供规则管理面板标出, 免得用户以为规则没生效是阅读器的问题。
+   */
+  const failedReplaceRules = ref<Record<string, string>>({})
   const preloadedContent = ref<Map<number, string>>(new Map()) // index -> content
   const preloadingContent = new Map<number, Promise<string | null>>()
   let chapterPreloadGeneration = 0
@@ -734,46 +1039,74 @@ export const useReaderStore = defineStore('reader', () => {
 
   /* ─── Chinese Conversion (OpenCC) ─── */
   /* ─── Content Filtering (Replace Rules) ─── */
+
+  /** 规则是否作用于当前这本书。 */
+  function matchReplaceRuleScope(rule: ReplaceRule) {
+    const currentBook = book.value
+    const scope = (rule.scope || '').trim()
+    if (!scope || scope === '*') return true
+    if (!currentBook) return false
+
+    if (scope.startsWith('source:')) {
+      return scope.slice('source:'.length) === currentBook.origin
+    }
+
+    if (scope.startsWith('book:')) {
+      return scope.slice('book:'.length) === currentBook.bookUrl
+    }
+
+    const scopeParts = scope.split(';')
+    if (scopeParts[0] !== '*' && scopeParts[0] !== currentBook.name) {
+      return false
+    }
+    return scopeParts.length === 1 || scopeParts[1] === currentBook.bookUrl
+  }
+
+  /** 当前生效的规则, 已按 order 排序。 */
+  const enabledReplaceRules = computed(() =>
+    [...replaceRules.value]
+      .filter(rule => rule.isEnabled && matchReplaceRuleScope(rule))
+      .sort((a, b) => a.order - b.order),
+  )
+
+  function isScriptRule(rule: ReplaceRule) {
+    return /^@js:/i.test((rule.replacement || '').trim())
+  }
+
+  /**
+   * 同步执行规则链, **跳过 `@js:` 脚本规则**。
+   *
+   * 脚本规则只能在 Rust 沙盒里跑（渲染进程执行第三方脚本等于把 IPC 面交出去），
+   * 所以这里先给出不含脚本的结果；`displayContent` 会在沙盒结果到达后替换成完整结果。
+   * 纯正则/字面量规则不经过 IPC，保持原来的同步渲染速度。
+   */
   function applyReplaceRules(text: string) {
     if (!text) return ''
     let result = text
     const currentBook = book.value
     if (currentBook?.readConfig?.useReplaceRule === false) return text
 
-    function matchRuleScope(rule: ReplaceRule) {
-      const scope = (rule.scope || '').trim()
-      if (!scope || scope === '*') return true
-      if (!currentBook) return false
+    // 每次执行都重算: 上一章的失败不该留到这一章, 也不该因为换书而残留。
+    failedReplaceRules.value = {}
 
-      if (scope.startsWith('source:')) {
-        return scope.slice('source:'.length) === currentBook.origin
+    for (const rule of enabledReplaceRules.value) {
+      if (isScriptRule(rule)) continue
+      const compiled = compileReplaceRule(rule.pattern, rule.isRegex, rule.replacement)
+      if (compiled.kind === 'error') {
+        // 收集而不是只 console.error：这些规则在导入时看起来是"成功"的, 但执行不了,
+        // 必须让用户在规则管理里看到, 否则只会觉得"导入了却没效果"。
+        failedReplaceRules.value[rule.name] = compiled.error
+        continue
       }
-
-      if (scope.startsWith('book:')) {
-        return scope.slice('book:'.length) === currentBook.bookUrl
-      }
-
-      const scopeParts = scope.split(';')
-      if (scopeParts[0] !== '*' && scopeParts[0] !== currentBook.name) {
-        return false
-      }
-      return scopeParts.length === 1 || scopeParts[1] === currentBook.bookUrl
-    }
-
-    // Sort by order and apply enabled rules
-    const enabledRules = [...replaceRules.value]
-      .filter(r => r.isEnabled && matchRuleScope(r))
-      .sort((a, b) => a.order - b.order)
-
-    for (const rule of enabledRules) {
+      if (compiled.kind === 'script') continue
       try {
-        if (rule.isRegex) {
-          const re = new RegExp(rule.pattern, 'gm')
-          result = result.replace(re, rule.replacement)
+        if (compiled.kind === 'regex') {
+          result = result.replace(compiled.regex, compiled.replacement)
         } else {
-          result = result.replaceAll(rule.pattern, rule.replacement)
+          result = result.replaceAll(compiled.needle, compiled.replacement)
         }
       } catch (e) {
+        failedReplaceRules.value[rule.name] = (e as Error).message
         console.error(`Failed to apply rule: ${rule.name}`, e)
       }
     }
@@ -808,8 +1141,84 @@ export const useReaderStore = defineStore('reader', () => {
     return applyReplaceRules(convertContent(text))
   }
 
+  /** 简繁转换结果。沙盒路径与同步路径都以它为输入，保证两边处理的是同一段文本。 */
+  const convertedContent = computed(() => convertContent(content.value))
+
+  /**
+   * 沙盒（含 `@js:` 脚本规则）的处理结果缓存。
+   *
+   * 只有在「输入文本 + 生效规则集」都没变时才复用；任何一方变化都要重跑，否则改了
+   * 规则或翻页后还会显示旧结果。
+   */
+  const sandboxedContent = ref<{ source: string; rulesKey: string; text: string } | null>(null)
+  let sandboxToken = 0
+
+  function replaceRulesKey(rules: ReplaceRule[]) {
+    return rules
+      .map(rule => `${rule.name}\u0000${rule.pattern}\u0000${rule.replacement}\u0000${rule.isRegex}`)
+      .join('\u0001')
+  }
+
+  // 脚本规则不能在前端执行，所以单独异步跑一次沙盒；同步路径先给出不含脚本的结果，
+  // 等沙盒返回后 `displayContent` 自动切到完整结果。没有脚本规则时这个 watcher 直接返回，
+  // 不会产生任何 IPC。
+  watch(
+    [convertedContent, enabledReplaceRules],
+    async ([source, rules]) => {
+      const scriptRules = rules.filter(isScriptRule)
+      if (!scriptRules.length || book.value?.readConfig?.useReplaceRule === false) {
+        sandboxedContent.value = null
+        return
+      }
+
+      const rulesKey = replaceRulesKey(rules)
+      if (
+        sandboxedContent.value?.source === source &&
+        sandboxedContent.value.rulesKey === rulesKey
+      ) {
+        return
+      }
+
+      const steps: SandboxReplaceRuleStep[] = []
+      for (const rule of rules) {
+        const compiled = toSandboxRuleStep(rule.pattern, rule.isRegex, rule.replacement)
+        if (!compiled.ok) {
+          failedReplaceRules.value[rule.name] = compiled.error
+          continue
+        }
+        steps.push(compiled.step)
+      }
+
+      const token = ++sandboxToken
+      try {
+        const text = await applyReplaceRulesInSandbox({ text: source, rules: steps })
+        if (token === sandboxToken) {
+          sandboxedContent.value = { source, rulesKey, text }
+        }
+      } catch (error) {
+        if (token === sandboxToken) {
+          sandboxedContent.value = null
+          // 整批失败时无法定位到具体哪条规则，把原因挂到脚本规则名下，让规则管理里能看见。
+          for (const rule of scriptRules) {
+            failedReplaceRules.value[rule.name] = (error as Error).message
+          }
+        }
+      }
+    },
+    { immediate: true },
+  )
+
   const displayContent = computed(() => {
-    return processContentForDisplay(content.value)
+    const source = convertedContent.value
+    const rules = enabledReplaceRules.value
+    if (!rules.some(isScriptRule)) return applyReplaceRules(source)
+
+    const cached = sandboxedContent.value
+    if (cached && cached.source === source && cached.rulesKey === replaceRulesKey(rules)) {
+      return cached.text
+    }
+    // 沙盒结果还没到：先显示同步结果（脚本规则暂不生效），到达后自动刷新。
+    return applyReplaceRules(source)
   })
 
   // 两个档位都要加载转换器: 「简体」档现在也要真的做繁→简(此前它什么都不做)。
@@ -1045,11 +1454,33 @@ export const useReaderStore = defineStore('reader', () => {
   const voiceList = ref<SpeechSynthesisVoice[]>([])
   const speechConfig = reactive<SpeechConfig>(loadSpeechConfig())
   const openAISpeechConfigured = computed(() => !!speechConfig.openaiBaseUrl.trim())
-  const speechProviderLabel = computed(() => speechConfig.provider === 'openai' ? 'API 语音' : '系统语音')
+  /** 在线朗读引擎是否可选：必须有选中的引擎 id；只切 provider 未选引擎时不算配置完成。 */
+  const httpSpeechConfigured = computed(() => (
+    speechConfig.httpTtsId != null && String(speechConfig.httpTtsId).trim() !== ''
+  ))
+  /**
+   * Edge 朗读是否可用：有音色、且在线即可，不需要任何密钥。
+   * 离线时 Edge 必然发不出请求，先在这里拦住，免得用户点朗读后只看到网络错误。
+   */
+  const edgeSpeechConfigured = computed(() => !!speechConfig.edgeVoice.trim() && appStore.isOnline)
+  /**
+   * 微软朗读是否可用：有音色且在线即可（演示接口不需要密钥）。
+   * 风格是可选的，所以不算进「配置完成」的判断。
+   */
+  const msSpeechConfigured = computed(() => !!speechConfig.msVoice.trim() && appStore.isOnline)
+  const speechProviderLabel = computed(() => {
+    if (speechConfig.provider === 'openai') return 'API 语音'
+    if (speechConfig.provider === 'http') return '在线朗读引擎'
+    if (speechConfig.provider === 'edge') return 'Edge 朗读'
+    if (speechConfig.provider === 'msdemo') return '微软朗读'
+    return '系统语音'
+  })
   const speechStopAt = ref(0)
   let speechStopTimer: number | null = null
   let synth: SpeechSynthesis | null = typeof window !== 'undefined' ? window.speechSynthesis : null
   let currentUtterance: SpeechSynthesisUtterance | null = null
+  // 下面三个名字带 OpenAI 的播放器状态由 openai / http 两个分支共用：
+  // 两者的音频都是一整段 Blob + HTMLAudioElement，各自持有会互相踩清理逻辑。
   let currentOpenAIAudio: HTMLAudioElement | null = null
   let currentOpenAIAudioUrl = ''
   let currentOpenAIAbortController: AbortController | null = null
@@ -1058,6 +1489,18 @@ export const useReaderStore = defineStore('reader', () => {
   const inFlightPreloadKeys = new Set<string>()
   const inFlightOpenAIAudioRequests = new Map<string, Promise<Blob>>()
   let currentTTSSessionId = 0
+  /**
+   * 缓冲流的外部控制句柄。
+   *
+   * 自动朗读的 http/openai 通道由 useReaderAutoPlayback 里的 SpeechStream 播放
+   * （它自己持有 <audio>），但暂停/停止按钮调的是 store.pauseTTS / store.stopTTS。
+   * 这里保存一个句柄让这两个入口把操作转给流，避免两套播放器并存。
+   */
+  let speechStreamControls: SpeechStreamControls | null = null
+
+  function attachSpeechStreamControls(controls: SpeechStreamControls | null) {
+    speechStreamControls = controls
+  }
 
   function logTTS(message: string, payload?: unknown) {
     void message
@@ -1282,6 +1725,131 @@ export const useReaderStore = defineStore('reader', () => {
     saveSpeechConfig()
   }
 
+  /**
+   * 选择在线朗读引擎。
+   *
+   * contentType 与 id 一起存：引擎换掉后旧的 MIME 兜底值就错了，必须跟着换。
+   */
+  function setHttpTtsId(id: number | string | null, contentType = '') {
+    speechConfig.httpTtsId = id
+    speechConfig.httpTtsContentType = id == null ? '' : normalizeAudioContentType(contentType)
+    saveSpeechConfig()
+  }
+
+  /**
+   * 旁白/对话分音色开关。
+   *
+   * 关闭时**不清空**已选的对话音色：用户往往是在「先关掉对比一下再打开」，
+   * 每次都要重选一遍会很难用。
+   */
+  function setDualVoiceEnabled(enabled: boolean) {
+    speechConfig.dualVoiceEnabled = enabled
+    // 预载队列里是默认音色的音频：开关状态一变它们的用途就不成立了，直接丢弃。
+    clearPreloadedOpenAIAudio()
+    saveSpeechConfig()
+  }
+
+  function setDialogueVoiceName(name: string) {
+    speechConfig.dialogueVoiceName = name
+    saveSpeechConfig()
+  }
+
+  function setDialogueOpenaiVoice(voice: string) {
+    speechConfig.dialogueOpenaiVoice = voice
+    clearPreloadedOpenAIAudio()
+    saveSpeechConfig()
+  }
+
+  /** 对话引擎。contentType 与 id 一起存，理由同 setHttpTtsId。 */
+  function setDialogueHttpTtsId(id: number | string | null, contentType = '') {
+    speechConfig.dialogueHttpTtsId = id
+    speechConfig.dialogueHttpTtsContentType = id == null ? '' : normalizeAudioContentType(contentType)
+    saveSpeechConfig()
+  }
+
+  /** 缓冲字符数：调大更抗网络抖动，调小更省请求。只影响自动朗读的缓冲流。 */
+  function setBufferChars(chars: number) {
+    speechConfig.bufferChars = normalizeBufferChars(chars)
+    saveSpeechConfig()
+  }
+
+  /** Edge 旁白音色。空值回默认音色，避免配置成空后合成请求必然失败。 */
+  function setEdgeVoice(voice: string) {
+    speechConfig.edgeVoice = normalizeEdgeVoice(voice)
+    saveSpeechConfig()
+  }
+
+  /** Edge 对话音色；空串表示跟随旁白音色（双音色开关关闭时保留）。 */
+  function setEdgeDialogueVoice(voice: string) {
+    speechConfig.edgeDialogueVoice = normalizeEdgeDialogueVoice(voice)
+    saveSpeechConfig()
+  }
+
+  /** Edge 音调偏移（Hz），夹到 -100..100。 */
+  function setEdgePitch(pitchHz: number) {
+    speechConfig.edgePitch = normalizeEdgeSignedLevel(pitchHz)
+    saveSpeechConfig()
+  }
+
+  /** Edge 音量偏移（%），夹到 -100..100。 */
+  function setEdgeVolume(volumePercent: number) {
+    speechConfig.edgeVolume = normalizeEdgeSignedLevel(volumePercent)
+    saveSpeechConfig()
+  }
+
+  /** Edge 音质档位；只接受 48k / 96k，其它值回 48k。 */
+  function setEdgeFormat(format: EdgeTtsFormat) {
+    speechConfig.edgeFormat = normalizeEdgeFormat(format)
+    saveSpeechConfig()
+  }
+
+  /* ─── 微软朗读 setters ─── */
+  function setMsVoice(voice: string) {
+    speechConfig.msVoice = normalizeMsVoice(voice)
+    saveSpeechConfig()
+  }
+
+  function setMsDialogueVoice(voice: string) {
+    speechConfig.msDialogueVoice = normalizeMsDialogueVoice(voice)
+    saveSpeechConfig()
+  }
+
+  /** 旁白风格；空串表示无风格。 */
+  function setMsStyle(style: string) {
+    speechConfig.msStyle = normalizeMsStyle(style)
+    saveSpeechConfig()
+  }
+
+  /** 对话风格；空串表示跟随旁白风格。 */
+  function setMsDialogueStyle(style: string) {
+    speechConfig.msDialogueStyle = normalizeMsStyle(style)
+    saveSpeechConfig()
+  }
+
+  /** 风格强度 0.5–2.0，保留一位小数。 */
+  function setMsStyleDegree(degree: number) {
+    speechConfig.msStyleDegree = normalizeMsStyleDegree(degree)
+    saveSpeechConfig()
+  }
+
+  /** 音调偏移（%），夹到 -50..50。 */
+  function setMsPitch(pitch: number) {
+    speechConfig.msPitch = normalizeMsLevel(pitch, MS_PITCH_MIN, MS_PITCH_MAX)
+    saveSpeechConfig()
+  }
+
+  /** 音量偏移（%），夹到 -100..100。 */
+  function setMsVolume(volume: number) {
+    speechConfig.msVolume = normalizeMsLevel(volume, MS_VOLUME_MIN, MS_VOLUME_MAX)
+    saveSpeechConfig()
+  }
+
+  /** 音质档位；只接受 48k / 96k / 192k。 */
+  function setMsFormat(format: MsTtsFormat) {
+    speechConfig.msFormat = normalizeMsFormat(format)
+    saveSpeechConfig()
+  }
+
   function setOpenAISpeechBaseUrl(url: string) {
     speechConfig.openaiBaseUrl = url.trim()
     clearPreloadedOpenAIAudio()
@@ -1365,7 +1933,14 @@ export const useReaderStore = defineStore('reader', () => {
     ].join('::')
   }
 
-  async function fetchOpenAIAudioBlob(rawText: string, signal?: AbortSignal) {
+  /**
+   * 合成一段文本的 API 语音 Blob。
+   *
+   * `voiceOverride` 供双音色路径逐段指定旁白/对话音色；缓存与预载仍只服务
+   * 单音色的默认 `openaiVoice`（缓存 key 里没有音色维度，混用会串音色）。
+   */
+  async function fetchOpenAIAudioBlob(rawText: string, signal?: AbortSignal, voiceOverride?: string) {
+    const voice = voiceOverride || speechConfig.openaiVoice
     const request = {
       apiFormat: speechConfig.apiFormat,
       baseUrl: speechConfig.openaiBaseUrl,
@@ -1373,7 +1948,7 @@ export const useReaderStore = defineStore('reader', () => {
       apiKey: speechConfig.openaiApiKey || undefined,
       input: rawText.slice(0, 4096),
       model: speechConfig.openaiModel,
-      voice: speechConfig.openaiVoice,
+      voice,
       format: speechConfig.openaiFormat,
       speed: speechConfig.speechRate,
       signal,
@@ -1431,6 +2006,9 @@ export const useReaderStore = defineStore('reader', () => {
   }
 
   async function preloadOpenAITTS(rawText?: string | string[] | null) {
+    // 双音色逐段合成不走单音色预载：缓存 key 里没有音色维度，且逐段播放要用
+    // 各自 voice 重新合成，预载的默认音色音频根本不会被消费 —— 只会白发请求。
+    if (speechConfig.dualVoiceEnabled) return
     if (speechConfig.provider !== 'openai' || !openAISpeechConfigured.value) return
     const texts = Array.isArray(rawText) ? rawText : [rawText || '']
     const normalizedTexts = texts.map((item) => item.trim()).filter(Boolean)
@@ -1714,6 +2292,95 @@ export const useReaderStore = defineStore('reader', () => {
     scheduleFinishWatchdog()
   }
 
+  /**
+   * 播放一段已合成好的音频（openai / http 共用）。
+   *
+   * 两条分支拿到的都是完整音频 Blob（一个是 API 返回，一个是后端 IPC 返回），
+   * 播放层完全一致：HTMLAudioElement + object URL。抽成一份而不是各写一遍，
+   * 因为 onplay/onpause/onended/onerror、进度上报、session 校验、object URL
+   * 回收任何一处漏改，都会表现为「第一段能播、后面没声」或内存泄漏。
+   */
+  function playTTSAudioBlob(
+    blob: Blob,
+    options: TTSOptions,
+    sessionId: number,
+    context: { logTag: string; errorMessage: string; textPreview?: string },
+  ): Promise<void> {
+    if (!isCurrentTTSSession(sessionId)) return Promise.resolve()
+    isSpeechLoading.value = false
+    currentOpenAIAudioUrl = URL.createObjectURL(blob)
+    const audio = new Audio(currentOpenAIAudioUrl)
+    currentOpenAIAudio = audio
+    currentOpenAIAbortController = null
+    const textPreview = context.textPreview || ''
+
+    const updateProgress = () => {
+      if (!isCurrentTTSSession(sessionId) || currentOpenAIAudio !== audio) return
+      if (!Number.isFinite(audio.duration) || audio.duration <= 0) return
+      const progress = Math.max(0, Math.min(1, audio.currentTime / audio.duration))
+      speechProgress.value = progress
+      options.onProgress?.(progress)
+    }
+
+    audio.onplay = () => {
+      if (!isCurrentTTSSession(sessionId) || currentOpenAIAudio !== audio) return
+      isSpeaking.value = true
+      isPaused.value = false
+      logTTS(`${context.logTag} onplay`, { sessionId, text: textPreview })
+      options.onStart?.()
+    }
+
+    audio.onpause = () => {
+      if (!isCurrentTTSSession(sessionId) || currentOpenAIAudio !== audio) return
+      if (!audio.ended) {
+        isPaused.value = true
+        isSpeaking.value = true
+      }
+    }
+
+    audio.onloadedmetadata = updateProgress
+    audio.ontimeupdate = updateProgress
+
+    audio.onended = () => {
+      if (currentOpenAIAudio === audio) {
+        currentOpenAIAudio = null
+      }
+      if (!isCurrentTTSSession(sessionId)) return
+      speechProgress.value = 1
+      options.onProgress?.(1)
+      isSpeaking.value = false
+      isPaused.value = false
+      logTTS(`${context.logTag} onended`, { sessionId, text: textPreview })
+      if (currentOpenAIAudioUrl) {
+        URL.revokeObjectURL(currentOpenAIAudioUrl)
+        currentOpenAIAudioUrl = ''
+      }
+      options.onEnd?.()
+    }
+
+    audio.onerror = () => {
+      if (currentOpenAIAudio === audio) {
+        currentOpenAIAudio = null
+      }
+      if (!isCurrentTTSSession(sessionId)) return
+      isSpeaking.value = false
+      isPaused.value = false
+      const error = new Error(context.errorMessage)
+      logTTS(`${context.logTag} onerror`, { sessionId, text: textPreview })
+      options.onError?.(error)
+    }
+
+    return audio.play().catch((error: Error) => {
+      if (!isCurrentTTSSession(sessionId)) return
+      isSpeechLoading.value = false
+      isSpeaking.value = false
+      isPaused.value = false
+      currentOpenAIAudio = null
+      logTTS(`${context.logTag} play catch`, { sessionId, message: error.message, text: textPreview })
+      options.onError?.(error)
+    })
+  }
+
   async function startOpenAITTS(rawText: string, options: TTSOptions, sessionId: number) {
     if (!openAISpeechConfigured.value) {
       const error = new Error('请先配置 API 语音服务')
@@ -1731,79 +2398,13 @@ export const useReaderStore = defineStore('reader', () => {
       voice: speechConfig.openaiVoice,
       text: rawText.slice(0, 80),
     })
+    // 播放器逻辑（含进度/回调/清理）与 http 分支共用，见 playTTSAudioBlob。
     const playBlob = (blob: Blob, controller: AbortController) => {
       if (controller.signal.aborted) return
-      if (!isCurrentTTSSession(sessionId)) return
-      isSpeechLoading.value = false
-      currentOpenAIAudioUrl = URL.createObjectURL(blob)
-      const audio = new Audio(currentOpenAIAudioUrl)
-      currentOpenAIAudio = audio
-      currentOpenAIAbortController = null
-
-      const updateProgress = () => {
-        if (!isCurrentTTSSession(sessionId) || currentOpenAIAudio !== audio) return
-        if (!Number.isFinite(audio.duration) || audio.duration <= 0) return
-        const progress = Math.max(0, Math.min(1, audio.currentTime / audio.duration))
-        speechProgress.value = progress
-        options.onProgress?.(progress)
-      }
-
-      audio.onplay = () => {
-        if (!isCurrentTTSSession(sessionId) || currentOpenAIAudio !== audio) return
-        isSpeaking.value = true
-        isPaused.value = false
-        logTTS('openai onplay', { sessionId, text: rawText.slice(0, 40) })
-        options.onStart?.()
-      }
-
-      audio.onpause = () => {
-        if (!isCurrentTTSSession(sessionId) || currentOpenAIAudio !== audio) return
-        if (!audio.ended) {
-          isPaused.value = true
-          isSpeaking.value = true
-        }
-      }
-
-      audio.onloadedmetadata = updateProgress
-      audio.ontimeupdate = updateProgress
-
-      audio.onended = () => {
-        if (currentOpenAIAudio === audio) {
-          currentOpenAIAudio = null
-        }
-        if (!isCurrentTTSSession(sessionId)) return
-        speechProgress.value = 1
-        options.onProgress?.(1)
-        isSpeaking.value = false
-        isPaused.value = false
-        logTTS('openai onended', { sessionId, text: rawText.slice(0, 40) })
-        if (currentOpenAIAudioUrl) {
-          URL.revokeObjectURL(currentOpenAIAudioUrl)
-          currentOpenAIAudioUrl = ''
-        }
-        options.onEnd?.()
-      }
-
-      audio.onerror = () => {
-        if (currentOpenAIAudio === audio) {
-          currentOpenAIAudio = null
-        }
-        if (!isCurrentTTSSession(sessionId)) return
-        isSpeaking.value = false
-        isPaused.value = false
-        const error = new Error('API 语音音频播放失败')
-        logTTS('openai onerror', { sessionId, text: rawText.slice(0, 40) })
-        options.onError?.(error)
-      }
-
-      return audio.play().catch((error: Error) => {
-        if (!isCurrentTTSSession(sessionId)) return
-        isSpeechLoading.value = false
-        isSpeaking.value = false
-        isPaused.value = false
-        currentOpenAIAudio = null
-        logTTS('openai play catch', { sessionId, message: error.message, text: rawText.slice(0, 40) })
-        options.onError?.(error)
+      return playTTSAudioBlob(blob, options, sessionId, {
+        logTag: 'openai',
+        errorMessage: 'API 语音音频播放失败',
+        textPreview: rawText.slice(0, 40),
       })
     }
 
@@ -1850,11 +2451,477 @@ export const useReaderStore = defineStore('reader', () => {
     })
   }
 
+  /** 在线朗读是否可用；不可用时给出一次明确提示并回调 onError。 */
+  function requireHttpSpeechConfigured(options: TTSOptions): boolean {
+    if (httpSpeechConfigured.value) return true
+    const error = new Error('请先在「朗读引擎」里选择在线朗读引擎')
+    isSpeechLoading.value = false
+    appStore.showToast(error.message, 'warning')
+    options.onError?.(error)
+    return false
+  }
+
+  /** http 通道统一失败处理：session 已过期时静默丢弃，避免覆盖新一次朗读。 */
+  function failHttpTts(error: unknown, sessionId: number, options: TTSOptions, textPreview: string, logTag: string) {
+    if (!isCurrentTTSSession(sessionId)) return
+    isSpeechLoading.value = false
+    isSpeaking.value = false
+    isPaused.value = false
+    currentOpenAIAudio = null
+    const message = (error as Error)?.message || '在线朗读请求失败'
+    logTTS(`${logTag} request catch`, { sessionId, message, text: textPreview.slice(0, 40) })
+    appStore.showToast(message, 'error')
+    options.onError?.(error as Error)
+  }
+
+  /**
+   * 在线朗读引擎（httpTTS）单段分支。
+   *
+   * 自动朗读不再走这里（缓冲流逐块合成，见 useReaderAutoPlayback），但手动
+   * `startTTS(text)` / 系统外的直接调用仍以「一段文本 = 一次请求」工作。
+   */
+  async function startHttpTts(rawText: string, options: TTSOptions, sessionId: number) {
+    if (!requireHttpSpeechConfigured(options)) return
+
+    isSpeechLoading.value = true
+    speechProgress.value = 0
+    options.onProgress?.(0)
+    logTTS('http speak queued', {
+      sessionId,
+      ttsId: speechConfig.httpTtsId,
+      text: rawText.slice(0, 80),
+    })
+
+    try {
+      const blob = await synthesizeHttpTts({
+        ttsId: speechConfig.httpTtsId as number | string,
+        text: rawText,
+        speed: speechConfig.speechRate,
+        contentType: speechConfig.httpTtsContentType,
+      })
+      if (!isCurrentTTSSession(sessionId)) return
+      await playTTSAudioBlob(blob, options, sessionId, {
+        logTag: 'http',
+        errorMessage: '在线朗读音频播放失败',
+        textPreview: rawText.slice(0, 40),
+      })
+    } catch (error) {
+      failHttpTts(error, sessionId, options, rawText, 'http')
+    }
+  }
+
+  /**
+   * 双音色 · 系统语音：每片段一条 utterance，连续 speak() 交给浏览器队列串行。
+   *
+   * 刻意不在 onend 里 speak 下一条：那等于自己维护第二套状态机，还要处理
+   * Safari 的 onend 时序/暂停恢复；浏览器的语音队列本来就保证串行。
+   */
+  function startSystemDualTTS(segments: SpeechSegment[], options: TTSOptions, sessionId: number) {
+    synth = resolveSpeechSynthesis()
+    if (!synth || typeof SpeechSynthesisUtterance === 'undefined') {
+      const error = new Error('当前系统不支持系统语音，请改用 API 语音')
+      isSpeechLoading.value = false
+      isSpeaking.value = false
+      isPaused.value = false
+      appStore.showToast(error.message, 'warning')
+      options.onError?.(error)
+      return
+    }
+    isSpeechLoading.value = false
+    if (!voiceList.value.length) {
+      fetchVoices()
+    }
+    speechProgress.value = 0
+    options.onProgress?.(0)
+    currentUtterance = null
+
+    const narrationVoice = voiceList.value.find((voice) => voice.name === speechConfig.voiceName)
+    // 对话音色留空时跟随旁白：开关打开但还没选第二音色是常见中间态。
+    const dialogueVoice = voiceList.value.find((voice) => voice.name === speechConfig.dialogueVoiceName) || narrationVoice
+    let started = false
+    let failed = false
+
+    segments.forEach((segment, index) => {
+      const utterance = new SpeechSynthesisUtterance(segment.text)
+      const voice = segment.type === 'dialogue' ? dialogueVoice : narrationVoice
+      utterance.lang = voice?.lang || 'zh-CN'
+      utterance.voice = voice || null
+      utterance.rate = speechConfig.speechRate
+      utterance.pitch = speechConfig.speechPitch
+
+      utterance.onstart = () => {
+        if (!isCurrentTTSSession(sessionId)) return
+        currentUtterance = utterance
+        isSpeaking.value = true
+        isPaused.value = false
+        if (!started) {
+          started = true
+          options.onStart?.()
+        }
+      }
+      utterance.onboundary = (event) => {
+        if (!isCurrentTTSSession(sessionId)) return
+        const charIndex = Number.isFinite(event.charIndex) ? event.charIndex : 0
+        const part = Math.max(0, Math.min(1, charIndex / Math.max(1, segment.text.length)))
+        const progress = (index + part) / segments.length
+        speechProgress.value = progress
+        options.onProgress?.(progress)
+      }
+      utterance.onend = () => {
+        if (currentUtterance === utterance) currentUtterance = null
+        if (!isCurrentTTSSession(sessionId)) return
+        if (index !== segments.length - 1) return
+        speechProgress.value = 1
+        options.onProgress?.(1)
+        isSpeaking.value = false
+        isPaused.value = false
+        logTTS('system dual onend', { sessionId, segments: segments.length })
+        options.onEnd?.()
+      }
+      utterance.onerror = (event) => {
+        // stopTTS 走 cancel()，会以 interrupted/canceled 触发 onerror —— 那不是
+        // 「播放失败」，不能把它回调给自动朗读（会误清高亮/状态）。
+        if (event?.error === 'interrupted' || event?.error === 'canceled') return
+        if (failed || !isCurrentTTSSession(sessionId)) return
+        failed = true
+        isSpeaking.value = false
+        isPaused.value = false
+        options.onError?.(event)
+      }
+      synth?.speak(utterance)
+    })
+  }
+
+  /**
+   * 双音色 · API 语音：逐段用各自的 voice 合成，再串行播放。
+   *
+   * 自动朗读的 http/openai 通道已改走 useReaderAutoPlayback 的缓冲流，这里保留
+   * 给直接 `startTTS(text)` 的调用方。不走预载缓存：缓存 key 里没有音色维度
+   * （见 buildOpenAIAudioCacheKey），双音色复用缓存会串音色。
+   */
+  async function startOpenAIDualTTS(segments: SpeechSegment[], options: TTSOptions, sessionId: number) {
+    if (!openAISpeechConfigured.value) {
+      const error = new Error('请先配置 API 语音服务')
+      isSpeechLoading.value = false
+      appStore.showToast(error.message, 'warning')
+      options.onError?.(error)
+      return
+    }
+    isSpeechLoading.value = true
+    speechProgress.value = 0
+    options.onProgress?.(0)
+    const controller = new AbortController()
+    currentOpenAIAbortController = controller
+    const narrationVoice = speechConfig.openaiVoice
+    const dialogueVoice = speechConfig.dialogueOpenaiVoice.trim() || narrationVoice
+    let index = 0
+
+    const playNext = () => {
+      if (!isCurrentTTSSession(sessionId)) return
+      if (index >= segments.length) {
+        options.onEnd?.()
+        return
+      }
+      const currentIndex = index
+      const segment = segments[currentIndex]
+      index += 1
+      const isLast = index >= segments.length
+      isSpeechLoading.value = true
+      void fetchOpenAIAudioBlob(
+        segment.text,
+        controller.signal,
+        segment.type === 'dialogue' ? dialogueVoice : narrationVoice,
+      ).then((blob) => {
+        if (!isCurrentTTSSession(sessionId)) return
+        void playTTSAudioBlob(blob, {
+          onStart: currentIndex === 0 ? () => options.onStart?.() : undefined,
+          onProgress: (progress) => {
+            const part = Math.max(0, Math.min(1, progress))
+            const overall = (currentIndex + part) / segments.length
+            speechProgress.value = overall
+            options.onProgress?.(overall)
+          },
+          onEnd: () => {
+            if (isLast) {
+              options.onEnd?.()
+              return
+            }
+            window.setTimeout(() => playNext(), 0)
+          },
+          onError: (error) => options.onError?.(error),
+        }, sessionId, {
+          logTag: 'openai-dual',
+          errorMessage: 'API 语音音频播放失败',
+          textPreview: segment.text.slice(0, 40),
+        })
+      }).catch((error) => {
+        if (controller.signal.aborted || !isCurrentTTSSession(sessionId)) return
+        isSpeechLoading.value = false
+        isSpeaking.value = false
+        isPaused.value = false
+        currentOpenAIAbortController = null
+        currentOpenAIAudio = null
+        const message = (error as Error)?.message || 'API 语音请求失败'
+        logTTS('openai dual request catch', { sessionId, message })
+        appStore.showToast(message, 'error')
+        options.onError?.(error as Error)
+      })
+    }
+
+    playNext()
+  }
+
+  /**
+   * 缓冲流用的单块合成：按 provider + 片段类型选引擎/音色。
+   *
+   * 这是「配置」与「播放」的分界：SpeechStream 只关心拿到 Blob，音色/引擎怎么
+   * 选（旁白 vs 对话、http 引擎 id、openai voice）都属于 store 的知识。
+   *
+   * @param type `'dialogue'` 只在双音色开启时由调用方产生；关闭时一律 narration。
+   * @param signal 停止朗读时中止在途请求。Tauri IPC 无法真正取消，因此返回前
+   *               会再查一次 signal，保证停止后不会把音频交给播放器。
+   */
+  async function synthesizeSpeechChunkBlob(
+    text: string,
+    type: SpeechSegmentType,
+    signal?: AbortSignal,
+  ): Promise<Blob> {
+    const rawText = text.trim()
+    if (!rawText) throw new Error('朗读文本为空')
+    if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError')
+    const useDialogue = type === 'dialogue' && speechConfig.dualVoiceEnabled
+
+    if (speechConfig.provider === 'http') {
+      const ttsId = (useDialogue ? speechConfig.dialogueHttpTtsId : null) ?? speechConfig.httpTtsId
+      if (ttsId == null) {
+        // 只抛错不弹 toast：调用方（缓冲流的 onError）统一提示，避免一次失败弹两条。
+        throw new Error('请先在「朗读引擎」里选择在线朗读引擎')
+      }
+      // 对话引擎未选时退回旁白引擎：等同于单音色，而不是让整段朗读失败。
+      const contentType = useDialogue
+        ? speechConfig.dialogueHttpTtsContentType || speechConfig.httpTtsContentType
+        : speechConfig.httpTtsContentType
+      const blob = await synthesizeHttpTts({
+        ttsId,
+        text: rawText,
+        speed: speechConfig.speechRate,
+        contentType,
+      })
+      if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError')
+      return blob
+    }
+
+    if (speechConfig.provider === 'edge') {
+      // 对话音色留空时跟随旁白音色（双音色开关打开但还没选第二个音色是常见中间态）。
+      const voice = useDialogue
+        ? speechConfig.edgeDialogueVoice.trim() || speechConfig.edgeVoice
+        : speechConfig.edgeVoice
+      if (!voice) throw new Error('请先选择 Edge 朗读音色')
+      const blob = await synthesizeEdgeTts({
+        text: rawText,
+        voice,
+        rate: formatEdgeRate(speechConfig.speechRate),
+        pitch: formatEdgePitch(speechConfig.edgePitch),
+        volume: formatEdgeVolume(speechConfig.edgeVolume),
+        format: speechConfig.edgeFormat,
+      })
+      if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError')
+      return blob
+    }
+
+    if (speechConfig.provider === 'msdemo') {
+      // 风格与音色同规则：对话优先用对话配置，留空跟随旁白。
+      const voice = useDialogue
+        ? speechConfig.msDialogueVoice.trim() || speechConfig.msVoice
+        : speechConfig.msVoice
+      if (!voice) throw new Error('请先选择微软朗读音色')
+      const style = useDialogue
+        ? speechConfig.msDialogueStyle.trim() || speechConfig.msStyle
+        : speechConfig.msStyle
+      const blob = await synthesizeMsTts({
+        text: rawText,
+        voice,
+        style: style || undefined,
+        styleDegree: style ? speechConfig.msStyleDegree : undefined,
+        // 这个通道的 rate/pitch/volume 都是带符号百分比串（pitch 不是 Hz）。
+        rate: formatEdgeRate(speechConfig.speechRate),
+        pitch: formatMsPercent(speechConfig.msPitch),
+        volume: formatMsPercent(speechConfig.msVolume),
+        format: speechConfig.msFormat,
+      })
+      if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError')
+      return blob
+    }
+
+    if (!openAISpeechConfigured.value) {
+      throw new Error('请先配置 API 语音服务')
+    }
+    const voice = useDialogue
+      ? speechConfig.dialogueOpenaiVoice.trim() || speechConfig.openaiVoice
+      : speechConfig.openaiVoice
+    return fetchOpenAIAudioBlob(rawText, signal, voice)
+  }
+
+  /**
+   * Edge 朗读的单次分支（自动朗读由缓冲流逐块合成，不走这里）。
+   *
+   * 直接调用 `startTTS(text)` 时按整段请求；双音色开启且确实切出多段时逐段
+   * 合成/播放（每段自己的音色），保证这条兜底路径与自动朗读的听感一致。
+   */
+  function startEdgeTts(rawText: string, options: TTSOptions, sessionId: number) {
+    if (!edgeSpeechConfigured.value) {
+      const error = new Error(appStore.isOnline ? '请先选择 Edge 朗读音色' : '当前离线，无法使用 Edge 朗读')
+      isSpeechLoading.value = false
+      appStore.showToast(error.message, 'warning')
+      options.onError?.(error)
+      return
+    }
+    const split = speechConfig.dualVoiceEnabled ? splitSpeechSegments(rawText) : []
+    const plan = split.length > 1 || (split.length === 1 && split[0].type === 'dialogue')
+      ? split
+      : [{ text: rawText, type: 'narration' as SpeechSegmentType }]
+    let index = 0
+    const playNext = () => {
+      if (!isCurrentTTSSession(sessionId)) return
+      if (index >= plan.length) {
+        options.onEnd?.()
+        return
+      }
+      const currentIndex = index
+      const segment = plan[currentIndex]
+      index += 1
+      const isLast = index >= plan.length
+      const voice = segment.type === 'dialogue' && speechConfig.dualVoiceEnabled
+        ? speechConfig.edgeDialogueVoice.trim() || speechConfig.edgeVoice
+        : speechConfig.edgeVoice
+      isSpeechLoading.value = true
+      void synthesizeEdgeTts({
+        text: segment.text,
+        voice,
+        rate: formatEdgeRate(speechConfig.speechRate),
+        pitch: formatEdgePitch(speechConfig.edgePitch),
+        volume: formatEdgeVolume(speechConfig.edgeVolume),
+        format: speechConfig.edgeFormat,
+      })
+        .then((blob) => {
+          if (!isCurrentTTSSession(sessionId)) return
+          void playTTSAudioBlob(blob, {
+            onStart: currentIndex === 0 ? () => options.onStart?.() : undefined,
+            onEnd: () => {
+              if (isLast) {
+                options.onEnd?.()
+                return
+              }
+              playNext()
+            },
+            onError: (error) => options.onError?.(error),
+          }, sessionId, {
+            logTag: 'edge',
+            errorMessage: 'Edge 朗读音频播放失败',
+            textPreview: segment.text.slice(0, 40),
+          })
+        })
+        .catch((error) => {
+          if (!isCurrentTTSSession(sessionId)) return
+          isSpeechLoading.value = false
+          isSpeaking.value = false
+          isPaused.value = false
+          currentOpenAIAudio = null
+          const message = (error as Error)?.message || 'Edge 朗读请求失败'
+          logTTS('edge request catch', { sessionId, message })
+          appStore.showToast(message, 'error')
+          options.onError?.(error as Error)
+        })
+    }
+    playNext()
+  }
+
+  /**
+   * 微软朗读的单次分支（自动朗读由缓冲流逐块合成，不走这里）。
+   *
+   * 与 Edge 的单次分支同构：直接 `startTTS(text)` 时按整段请求；双音色开启且
+   * 切出多段时逐段合成/播放（音色与风格都按旁白/对话规则选择）。
+   */
+  function startMsTts(rawText: string, options: TTSOptions, sessionId: number) {
+    if (!msSpeechConfigured.value) {
+      const error = new Error(appStore.isOnline ? '请先选择微软朗读音色' : '当前离线，无法使用微软朗读')
+      isSpeechLoading.value = false
+      appStore.showToast(error.message, 'warning')
+      options.onError?.(error)
+      return
+    }
+    const split = speechConfig.dualVoiceEnabled ? splitSpeechSegments(rawText) : []
+    const plan = split.length > 1 || (split.length === 1 && split[0].type === 'dialogue')
+      ? split
+      : [{ text: rawText, type: 'narration' as SpeechSegmentType }]
+    let index = 0
+    const playNext = () => {
+      if (!isCurrentTTSSession(sessionId)) return
+      if (index >= plan.length) {
+        options.onEnd?.()
+        return
+      }
+      const currentIndex = index
+      const segment = plan[currentIndex]
+      index += 1
+      const isLast = index >= plan.length
+      const dialogue = segment.type === 'dialogue' && speechConfig.dualVoiceEnabled
+      const voice = dialogue
+        ? speechConfig.msDialogueVoice.trim() || speechConfig.msVoice
+        : speechConfig.msVoice
+      const style = dialogue
+        ? speechConfig.msDialogueStyle.trim() || speechConfig.msStyle
+        : speechConfig.msStyle
+      isSpeechLoading.value = true
+      void synthesizeMsTts({
+        text: segment.text,
+        voice,
+        style: style || undefined,
+        styleDegree: style ? speechConfig.msStyleDegree : undefined,
+        rate: formatEdgeRate(speechConfig.speechRate),
+        pitch: formatMsPercent(speechConfig.msPitch),
+        volume: formatMsPercent(speechConfig.msVolume),
+        format: speechConfig.msFormat,
+      })
+        .then((blob) => {
+          if (!isCurrentTTSSession(sessionId)) return
+          void playTTSAudioBlob(blob, {
+            onStart: currentIndex === 0 ? () => options.onStart?.() : undefined,
+            onEnd: () => {
+              if (isLast) {
+                options.onEnd?.()
+                return
+              }
+              playNext()
+            },
+            onError: (error) => options.onError?.(error),
+          }, sessionId, {
+            logTag: 'msdemo',
+            errorMessage: '微软朗读音频播放失败',
+            textPreview: segment.text.slice(0, 40),
+          })
+        })
+        .catch((error) => {
+          if (!isCurrentTTSSession(sessionId)) return
+          isSpeechLoading.value = false
+          isSpeaking.value = false
+          isPaused.value = false
+          currentOpenAIAudio = null
+          const message = (error as Error)?.message || '微软朗读请求失败'
+          logTTS('msdemo request catch', { sessionId, message })
+          appStore.showToast(message, 'error')
+          options.onError?.(error as Error)
+        })
+    }
+    playNext()
+  }
+
   function startTTS(text?: string, options: TTSOptions = {}, interruptCurrent = true) {
     const hasActiveSystemSpeech = !!synth && (synth.speaking || synth.pending || !!currentUtterance)
     const hasActiveOpenAISpeech = !!currentOpenAIAudio || !!currentOpenAIAbortController
 
-    if (interruptCurrent && (hasActiveSystemSpeech || hasActiveOpenAISpeech || isSpeaking.value || isSpeechLoading.value)) {
+    // 缓冲流自己持有 <audio>：中断时也要把它停掉，否则新朗读会和旧流叠着播。
+    if (interruptCurrent && (hasActiveSystemSpeech || hasActiveOpenAISpeech || speechStreamControls !== null || isSpeaking.value || isSpeechLoading.value)) {
       stopTTS(false)
     }
 
@@ -1885,8 +2952,45 @@ export const useReaderStore = defineStore('reader', () => {
       }
     }
 
+    // 双音色：只有「开关打开 + 确实需要换音色」才走新路径。
+    // - 多片段：旁白与对话交替，必须走；
+    // - 单片段但整段都是对话（`“你来了。”` 这种一句对白一段的排版极常见）：
+    //   也必须用对话音色，只按「片段数 > 1」判断会让这些段落全用旁白念。
+    // - 单片段且是旁白：继续走原来的单音色逻辑，行为逐字节不变。
+    // 注意：自动朗读的 http/openai 已在 useReaderAutoPlayback 的缓冲流里逐块按
+    // 类型合成，不走这里；这里只有 system 与直接调用方会用。
+    const dualSegments = speechConfig.dualVoiceEnabled ? splitSpeechSegments(rawText) : []
+    const useDualVoice = dualSegments.length > 1
+      || (dualSegments.length === 1 && dualSegments[0].type === 'dialogue')
+    if (useDualVoice) {
+      if (speechConfig.provider === 'openai') {
+        void startOpenAIDualTTS(dualSegments, options, sessionId)
+        return
+      }
+      if (speechConfig.provider === 'system') {
+        startSystemDualTTS(dualSegments, options, sessionId)
+        return
+      }
+      // http 的双音色由缓冲流负责；直接调用时退化为「整段用旁白引擎」。
+    }
+
     if (speechConfig.provider === 'openai') {
       void startOpenAITTS(rawText, options, sessionId)
+      return
+    }
+
+    if (speechConfig.provider === 'http') {
+      void startHttpTts(rawText, options, sessionId)
+      return
+    }
+
+    if (speechConfig.provider === 'edge') {
+      startEdgeTts(rawText, options, sessionId)
+      return
+    }
+
+    if (speechConfig.provider === 'msdemo') {
+      startMsTts(rawText, options, sessionId)
       return
     }
 
@@ -1894,7 +2998,20 @@ export const useReaderStore = defineStore('reader', () => {
   }
 
   function pauseTTS() {
-    if (speechConfig.provider === 'openai') {
+    // 缓冲流自己持有 <audio>：暂停/恢复必须转给它，否则按钮看起来没反应。
+    if (speechStreamControls) {
+      if (isPaused.value) {
+        speechStreamControls.resume()
+        isPaused.value = false
+      } else {
+        speechStreamControls.pause()
+        isPaused.value = true
+        isSpeaking.value = true
+      }
+      return
+    }
+    // http / openai / edge / msdemo 都是 HTMLAudioElement，暂停/恢复逻辑完全一致。
+    if (speechConfig.provider === 'openai' || speechConfig.provider === 'http' || speechConfig.provider === 'edge' || speechConfig.provider === 'msdemo') {
       if (!currentOpenAIAudio) return
       if (currentOpenAIAudio.paused) {
         const audio = currentOpenAIAudio
@@ -1923,6 +3040,10 @@ export const useReaderStore = defineStore('reader', () => {
   }
 
   function stopTTS(resetCallbacks = true) {
+    // 先停缓冲流并摘掉句柄，避免它的 onIdle/onError 回调再进 stopTTS 造成重入。
+    const streamControls = speechStreamControls
+    speechStreamControls = null
+    streamControls?.stop()
     const sessionId = beginTTSSession()
     logTTS('stopTTS', {
       sessionId,
@@ -1942,6 +3063,239 @@ export const useReaderStore = defineStore('reader', () => {
     if (resetCallbacks) {
       clearSpeechStopTimer()
     }
+  }
+
+  /* ─── 语音试听（设置页「语音测试」） ───
+   *
+   * 试听必须与书内朗读完全隔离：
+   * - 用的不是 isSpeaking / speechProgress 那套状态，而是独立的 refs，
+   *   否则试听会让听书面板/进度条误以为正在朗读；
+   * - 试听前先 stopTTS()，避免两条声音叠在一起；
+   * - 独立 <audio> / utterance + 独立 URL，停止时自己回收，不碰主播放器的清理逻辑。
+   */
+  const isSpeechPreviewing = ref(false)
+  const isSpeechPreviewLoading = ref(false)
+  let previewSessionId = 0
+  let previewUtterance: SpeechSynthesisUtterance | null = null
+  let previewAudio: HTMLAudioElement | null = null
+  let previewAudioUrl = ''
+  let previewAbortController: AbortController | null = null
+
+  function hasActiveSpeechPreview() {
+    return isSpeechPreviewing.value || isSpeechPreviewLoading.value || !!previewUtterance || !!previewAudio
+  }
+
+  /** 释放当前试听 <audio> 与 objectURL（不推进 session、不动 utterance）。 */
+  function releasePreviewAudio() {
+    if (previewAudio) {
+      previewAudio.onplay = null
+      previewAudio.onended = null
+      previewAudio.onerror = null
+      try {
+        previewAudio.pause()
+      } catch {
+        // 忽略：部分平台清空 src 后 pause 会抛
+      }
+      previewAudio.src = ''
+      previewAudio = null
+    }
+    if (previewAudioUrl) {
+      try {
+        URL.revokeObjectURL(previewAudioUrl)
+      } catch {
+        // 测试环境可能没有 revokeObjectURL
+      }
+      previewAudioUrl = ''
+    }
+  }
+
+  function cleanupSpeechPreview() {
+    // 先推进 session：迟到的合成结果 / 事件回调据此丢弃，不能再开始播放。
+    previewSessionId += 1
+    previewAbortController?.abort()
+    previewAbortController = null
+    if (previewUtterance) {
+      previewUtterance.onstart = null
+      previewUtterance.onend = null
+      previewUtterance.onerror = null
+      previewUtterance = null
+      // 只有试听用 utterance 时才 cancel，避免误伤书内朗读（试听前已 stopTTS，
+      // 这里 cancel 只是清掉可能排队的试听语音）。
+      try {
+        synth?.cancel()
+      } catch {
+        // ignore platform-specific cancel errors
+      }
+    }
+    releasePreviewAudio()
+    isSpeechPreviewing.value = false
+    isSpeechPreviewLoading.value = false
+  }
+
+  /**
+   * 停止试听。没有在试听时什么都不做 —— 面板卸载/切通道会无条件调用它，
+   * 若无条件 cancel synth 会把用户正在听的书内朗读一起掐掉。
+   */
+  function stopSpeechPreview() {
+    if (!hasActiveSpeechPreview()) return
+    cleanupSpeechPreview()
+  }
+
+  function failSpeechPreview(error: unknown) {
+    cleanupSpeechPreview()
+    const message = (error as Error)?.message || '试听失败'
+    appStore.showToast(message, 'error')
+  }
+
+  /** 系统语音试听某一段时该用的音色：对话段用对话音色（未配置则跟随旁白）。 */
+  function resolvePreviewSystemVoice(segmentType: SpeechSegmentType) {
+    const narrationVoice = voiceList.value.find((voice) => voice.name === speechConfig.voiceName)
+    if (segmentType !== 'dialogue' || !speechConfig.dualVoiceEnabled) return narrationVoice
+    return voiceList.value.find((voice) => voice.name === speechConfig.dialogueVoiceName) || narrationVoice
+  }
+
+  /**
+   * 系统语音逐段试听：一段播完（onend）再 speak 下一段。
+   *
+   * 不一次性把整串 utterance 丢进浏览器队列：那样 stop 时只能靠 cancel 清队列，
+   * 而且无法在中途正确切换音色/判断结束。
+   */
+  function speakPreviewSegment(
+    index: number,
+    plan: SpeechSegment[],
+    session: number,
+    speech: SpeechSynthesis,
+  ) {
+    if (session !== previewSessionId) return
+    if (index >= plan.length) {
+      cleanupSpeechPreview()
+      return
+    }
+    const segment = plan[index]
+    const utterance = new SpeechSynthesisUtterance(segment.text)
+    const voice = resolvePreviewSystemVoice(segment.type)
+    utterance.lang = voice?.lang || 'zh-CN'
+    utterance.voice = voice || null
+    utterance.rate = speechConfig.speechRate
+    utterance.pitch = speechConfig.speechPitch
+    previewUtterance = utterance
+    utterance.onstart = () => {
+      if (session !== previewSessionId) return
+      isSpeechPreviewLoading.value = false
+      isSpeechPreviewing.value = true
+    }
+    utterance.onend = () => {
+      if (session !== previewSessionId) return
+      if (previewUtterance === utterance) previewUtterance = null
+      speakPreviewSegment(index + 1, plan, session, speech)
+    }
+    utterance.onerror = (event) => {
+      if (session !== previewSessionId) return
+      // 用户点停止会以 interrupted/canceled 触发，不是错误。
+      if (event.error === 'interrupted' || event.error === 'canceled') {
+        cleanupSpeechPreview()
+        return
+      }
+      failSpeechPreview(new Error('系统语音试听失败'))
+    }
+    speech.speak(utterance)
+  }
+
+  /**
+   * 在线通道逐段试听：每段合成完播放，播完再合成下一段。
+   *
+   * 串行而不是并行预热：每段的音色/风格都可能不同，且必须严格按文本顺序出声；
+   * 串行也让 stop 时最多只有一个在途请求需要丢弃。
+   */
+  function playPreviewSegment(
+    index: number,
+    plan: SpeechSegment[],
+    session: number,
+    controller: AbortController,
+  ) {
+    if (session !== previewSessionId) return
+    if (index >= plan.length) {
+      cleanupSpeechPreview()
+      return
+    }
+    const segment = plan[index]
+    void synthesizeSpeechChunkBlob(segment.text, segment.type, controller.signal)
+      .then((blob) => {
+        if (session !== previewSessionId) return
+        const url = URL.createObjectURL(blob)
+        previewAudioUrl = url
+        const audio = new Audio(url)
+        previewAudio = audio
+        audio.onplay = () => {
+          if (session !== previewSessionId) return
+          isSpeechPreviewLoading.value = false
+          isSpeechPreviewing.value = true
+        }
+        audio.onended = () => {
+          if (session !== previewSessionId) return
+          releasePreviewAudio()
+          playPreviewSegment(index + 1, plan, session, controller)
+        }
+        audio.onerror = () => {
+          if (session !== previewSessionId) return
+          failSpeechPreview(new Error('试听音频播放失败'))
+        }
+        void audio.play().then(() => {
+          if (session !== previewSessionId) return
+          // 有的环境不触发 onplay（自动播放策略/测试替身），play() 成功即代表已在播。
+          isSpeechPreviewLoading.value = false
+          isSpeechPreviewing.value = true
+        }).catch((error) => {
+          if (session !== previewSessionId) return
+          failSpeechPreview(error)
+        })
+      })
+      .catch((error) => {
+        if (session !== previewSessionId) return
+        if ((error as Error)?.name === 'AbortError') {
+          cleanupSpeechPreview()
+          return
+        }
+        failSpeechPreview(error)
+      })
+  }
+
+  async function previewSpeech(text: string) {
+    stopSpeechPreview()
+    // 试听前先停下书内朗读（含缓冲流），避免两条声音重叠、也避免抢占语音队列。
+    stopTTS()
+    const rawText = (text || '').trim()
+    if (!rawText) {
+      appStore.showToast('请先输入要试听的文本', 'warning')
+      return
+    }
+    const session = ++previewSessionId
+    isSpeechPreviewLoading.value = true
+    isSpeechPreviewing.value = false
+    // 双音色 +（多片段，或唯一片段是对白）才走分段路径 —— 与自动朗读的分流规则一致：
+    // 试听框只填一句「“你好。”」时用户开双音色就是想听对话音色，不能仍按旁白合成。
+    const segments = speechConfig.dualVoiceEnabled ? splitSpeechSegments(rawText) : []
+    const useSegmented = segments.length > 1 || segments[0]?.type === 'dialogue'
+    const plan = useSegmented
+      ? segments
+      : [{ text: rawText, type: 'narration' as SpeechSegmentType }]
+
+    if (speechConfig.provider === 'system') {
+      synth = resolveSpeechSynthesis()
+      if (!synth || typeof SpeechSynthesisUtterance === 'undefined') {
+        failSpeechPreview(new Error('当前系统不支持系统语音，请改用其它朗读通道'))
+        return
+      }
+      if (!voiceList.value.length) {
+        fetchVoices()
+      }
+      speakPreviewSegment(0, plan, session, synth)
+      return
+    }
+
+    const controller = new AbortController()
+    previewAbortController = controller
+    playPreviewSegment(0, plan, session, controller)
   }
 
   /* ─── Book / chapter ops ─── */
@@ -2750,13 +4104,18 @@ export const useReaderStore = defineStore('reader', () => {
     activePanel, openPanel, togglePanel, backPanel, closePanel,
     bookmarks, fetchBookmarks, addBookmark, removeBookmark, removeBookmarks,
     readChapterKeys, isChapterRead, markChapterAsRead,
-    replaceRules, fetchReplaceRules,
+    replaceRules, fetchReplaceRules, failedReplaceRules,
     switchSource, preloadNextChapter, preloadAroundChapter, isChapterReady,
     refreshChapters, refreshTocFromSource,
     isSpeaking, isSpeechLoading, isPaused, speechProgress, startTTS, pauseTTS, stopTTS,
-    voiceList, speechConfig, speechStopAt, speechProviderLabel, openAISpeechConfigured,
+    voiceList, speechConfig, speechStopAt, speechProviderLabel, openAISpeechConfigured, httpSpeechConfigured, edgeSpeechConfigured, msSpeechConfigured,
     systemTtsNativeEventsReliable, systemSpeechSupported,
-    fetchVoices, setVoiceName, setSpeechProvider, setSpeechRate, setSpeechPitch, setSpeechStopTimer, clearSpeechStopTimer,
+    fetchVoices, setVoiceName, setSpeechProvider, setHttpTtsId, setSpeechRate, setSpeechPitch, setSpeechStopTimer, clearSpeechStopTimer,
+    setDualVoiceEnabled, setDialogueVoiceName, setDialogueOpenaiVoice, setDialogueHttpTtsId, setBufferChars,
+    setEdgeVoice, setEdgeDialogueVoice, setEdgePitch, setEdgeVolume, setEdgeFormat,
+    setMsVoice, setMsDialogueVoice, setMsStyle, setMsDialogueStyle, setMsStyleDegree, setMsPitch, setMsVolume, setMsFormat,
+    isSpeechPreviewing, isSpeechPreviewLoading, previewSpeech, stopSpeechPreview,
+    attachSpeechStreamControls, synthesizeSpeechChunkBlob,
     setOpenAISpeechSource, setSpeechApiFormat, setOpenAISpeechBaseUrl, setSpeechProxyUrl, setOpenAISpeechApiKey, setOpenAISpeechModel, setOpenAISpeechVoice, setOpenAISpeechFormat, setOpenAISpeechRequestMode, preloadOpenAITTS,
     displayContent, processContentForDisplay,
     isAutoScrolling,

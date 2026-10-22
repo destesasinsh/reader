@@ -1,14 +1,16 @@
 pub mod commands;
+pub mod deep_link;
 pub mod protocol;
 
 use crate::app::config::AppConfig;
 use tauri::ipc::Invoke;
 use crate::service::{
     book_group_service::BookGroupService, book_service::BookService,
-    book_source_service::BookSourceService, json_document_service::JsonDocumentService,
-    local_epub_book::LocalEpubBookService, local_pdf_book::LocalPdfBookService,
-    local_txt_book::LocalTxtBookService, reading_stats_service::ReadingStatsService,
-    update_service::UpdateService, user_service::UserService,
+    book_source_service::BookSourceService, http_tts_service::HttpTtsService,
+    json_document_service::JsonDocumentService, local_epub_book::LocalEpubBookService,
+    local_pdf_book::LocalPdfBookService, local_txt_book::LocalTxtBookService,
+    reading_stats_service::ReadingStatsService, update_service::UpdateService,
+    user_service::UserService,
 };
 use std::sync::Arc;
 
@@ -25,6 +27,7 @@ pub struct AppState {
     pub json_document_service: Arc<JsonDocumentService>,
     pub reading_stats_service: Arc<ReadingStatsService>,
     pub update_service: Arc<UpdateService>,
+    pub http_tts_service: Arc<HttpTtsService>,
 }
 
 /// Every IPC command, registered by the desktop shell via `.invoke_handler(...)`.
@@ -70,6 +73,15 @@ pub fn invoke_handler() -> impl Fn(Invoke<tauri::Wry>) -> bool + Send + Sync + '
         commands::book::book_source_debug_sse,
         commands::book::get_txt_toc_rules,
         commands::export::export_books_sse,
+        commands::http_tts::get_http_tts_list,
+        commands::http_tts::save_http_tts_list,
+        commands::http_tts::delete_http_tts,
+        commands::http_tts::read_remote_http_tts_file,
+        commands::http_tts::synthesize_http_tts,
+        commands::edge_tts::edge_tts_list_voices,
+        commands::edge_tts::edge_tts_synthesize,
+        commands::ms_demo_tts::ms_tts_list_voices,
+        commands::ms_demo_tts::ms_tts_synthesize,
         commands::book_group::get_book_groups,
         commands::book_group::save_book_group,
         commands::book_group::delete_book_group,
@@ -119,6 +131,7 @@ pub fn invoke_handler() -> impl Fn(Invoke<tauri::Wry>) -> bool + Send + Sync + '
         commands::replace_rule::save_replace_rules,
         commands::replace_rule::delete_replace_rule,
         commands::replace_rule::delete_replace_rules,
+        commands::replace_rule::apply_replace_rules,
         commands::rss::get_rss_sources,
         commands::rss::save_rss_source,
         commands::rss::save_rss_sources,
@@ -130,6 +143,8 @@ pub fn invoke_handler() -> impl Fn(Invoke<tauri::Wry>) -> bool + Send + Sync + '
         commands::rss::get_rss_content,
         commands::rss::open_rss_source_panel,
         commands::speech::request_speech_audio,
+        deep_link::take_pending_legado_deeplink,
+        deep_link::read_remote_text_file,
         commands::update::get_version_update,
         commands::update::dismiss_version_update,
         commands::update::apply_desktop_update,
