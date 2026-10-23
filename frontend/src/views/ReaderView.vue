@@ -229,7 +229,7 @@
           <!-- 脚本规则没跑成时正文会回落到「不含脚本」的版本，与脚本本来就没启用
                看起来完全一样。必须显式说明，否则用户只会以为规则没效果。 -->
           <div v-if="store.replaceRulesDegraded" class="replace-rule-degraded">
-            本章有 {{ failedScriptRuleCount }} 条净化脚本未能执行，正文按未执行脚本处理。
+            本章有 {{ store.failedScriptRuleCount }} 条净化脚本未能执行，正文按未执行脚本处理。
             <button type="button" class="replace-rule-degraded-link" @click="store.openPanel('rule')">
               查看规则
             </button>
@@ -1289,9 +1289,6 @@ const formattedContent = computed(() => {
   if (isPdfPageChapter.value) return store.displayContent || ''
   return formatChapterHtml(store.displayContent || '')
 })
-
-/** 降级提示里要说的脚本规则条数（取 store 里记录的真实失败条数）。 */
-const failedScriptRuleCount = computed(() => Object.keys(store.failedReplaceRules).length)
 
 /** 上一章 PDF 页渲染的释放函数: 换章/卸载时必须调用, 否则 canvas 与文档常驻 */
 let disposePdfPages: (() => void) | null = null

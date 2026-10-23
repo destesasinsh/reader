@@ -1246,6 +1246,18 @@ export const useReaderStore = defineStore('reader', () => {
     return sandboxFailureKey.value === `${convertedContent.value}\u0002${replaceRulesKey(rules)}`
   })
 
+  /**
+   * 降级横幅里要说的「脚本规则未能执行」条数。
+   *
+   * 只数 `@js:` 规则：`failedReplaceRules` 里还可能有同步路径记录下来的**正则**规则
+   * 失败，而横幅的文案是「净化脚本未能执行」，混在一起会多报。
+   */
+  const failedScriptRuleCount = computed(() =>
+    enabledReplaceRules.value.filter(
+      rule => isScriptRule(rule) && Boolean(failedReplaceRules.value[rule.name]),
+    ).length,
+  )
+
   // 两个档位都要加载转换器: 「简体」档现在也要真的做繁→简(此前它什么都不做)。
   // 「关闭」档不加载 —— 那份词表本身就有 60KB+1MB, 不需要为不转换的档位付费。
   watch(
@@ -4142,7 +4154,7 @@ export const useReaderStore = defineStore('reader', () => {
     isSpeechPreviewing, isSpeechPreviewLoading, previewSpeech, stopSpeechPreview,
     attachSpeechStreamControls, synthesizeSpeechChunkBlob,
     setOpenAISpeechSource, setSpeechApiFormat, setOpenAISpeechBaseUrl, setSpeechProxyUrl, setOpenAISpeechApiKey, setOpenAISpeechModel, setOpenAISpeechVoice, setOpenAISpeechFormat, setOpenAISpeechRequestMode, preloadOpenAITTS,
-    displayContent, processContentForDisplay, replaceRulesDegraded,
+    displayContent, processContentForDisplay, replaceRulesDegraded, failedScriptRuleCount,
     isAutoScrolling,
     readerControlsVisible,
     hotkeyBindings, hotkeyActions, hotkeysAreDefault, setHotkeyBinding, resetHotkeyBindings,
