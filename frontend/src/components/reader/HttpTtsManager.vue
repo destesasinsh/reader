@@ -218,10 +218,11 @@ onMounted(loadEngines)
 .http-tts-overlay {
   position: fixed;
   inset: 0;
-  /* 阅读抽屉 50、加载浮层 200，这里要在它们之上；但必须留在全局
-     --z-modal(400) 之下，否则删除确认框(ConfirmDialog)会被本面板盖住、
-     用户点不到「确定」。 */
-  z-index: 250;
+  /* 两个入口：阅读页的抽屉（z 40–90）、主设置里的「阅读增强」面板
+     （--z-nested-overlay: 600）。必须压过两者，又在toast(700)之下 ——
+     否则「已删除」这类操作提示会被面板挡住。
+     删除确认框是 --z-nested-overlay+10(610)，也会盖住本面板。 */
+  z-index: var(--z-nested-overlay);
   display: flex;
   align-items: center;
   justify-content: center;

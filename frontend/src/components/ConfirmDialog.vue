@@ -33,7 +33,9 @@ function cancel() {
 .confirm-overlay {
   position: fixed;
   inset: 0;
-  z-index: calc(var(--z-modal) + 10);
+  /* 确认框必须压在**任何**面板之上：它可能从主设置里打开的嵌套面板
+     （--z-nested-overlay: 600）中触发，用 --z-modal+10 会被面板盖住、点不到。 */
+  z-index: calc(var(--z-nested-overlay) + 10);
   display: flex;
   align-items: center;
   justify-content: center;

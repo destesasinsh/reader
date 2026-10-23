@@ -257,7 +257,6 @@
         </div>
       </div>
 
-      <div class="settings-sep"></div>
       <!-- 预加载 -->
       <div class="setting-row">
         <label>&#x9884;&#x52A0;&#x8F7D;</label>
@@ -459,19 +458,22 @@
           <button
             class="opt-btn"
             :class="{ active: store.speechConfig.provider === 'http' }"
-            title="使用 Legado 在线朗读引擎（httpTTS）"
+            :disabled="appStore.isWebMode"
+            :title="appStore.isWebMode ? '在线朗读引擎走 Tauri 命令，Web 阅读模式没有对应接口' : '使用 Legado 在线朗读引擎（httpTTS）'"
             @click="store.setSpeechProvider('http')"
           >在线朗读引擎</button>
           <button
             class="opt-btn"
             :class="{ active: store.speechConfig.provider === 'edge' }"
-            title="使用微软 Edge 在线朗读（无需 API Key）"
+            :disabled="appStore.isWebMode"
+            :title="appStore.isWebMode ? 'Edge 朗读需要 WebSocket 直连，浏览器跨域会被拦' : '使用微软 Edge 在线朗读（无需 API Key）'"
             @click="store.setSpeechProvider('edge')"
           >Edge 朗读</button>
           <button
             class="opt-btn"
             :class="{ active: store.speechConfig.provider === 'msdemo' }"
-            title="微软朗读（演示接口）：支持风格与更高音质，无需 API Key"
+            :disabled="appStore.isWebMode"
+            :title="appStore.isWebMode ? '微软朗读走 Tauri 命令，Web 阅读模式没有对应接口' : '微软朗读（演示接口）：支持风格与更高音质，无需 API Key'"
             @click="store.setSpeechProvider('msdemo')"
           >微软朗读</button>
         </div>
@@ -2086,22 +2088,72 @@ onMounted(async () => {
   margin-top: -8px;
 }
 
+/* ─── 行布局：所有「标签 + 控件」行共用同一套栅格 ───
+ *
+ * 两套布局并存是「没对齐」的根源：普通行是 flex（label min-width 70px）、
+ * 滑块行是 grid（label 96px、右对齐、滑块固定 240px）。于是同一屏里标签右缘、
+ * 控件左缘都各走各的。
+ *
+ * 现在统一成一条栅格：`104px` 标签列 + 剩余宽度控件列，标签**左对齐**。
+ * 选左对齐而不是右对齐，是因为面板里还有 `.setting-block-head` 的块标题
+ *（「阅读配色」「阅读页背景图」）——那些天然是左对齐的块级文字。只有让行标签
+ * 也左对齐，整块面板才会只剩**一条**文本竖线，视觉上才是齐的。
+ * 104px 是「左右页上下边距」（7 个汉字，14px 字号）不换行的最小宽度。
+ */
 .setting-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr);
   align-items: center;
-  gap: 20px;
+  column-gap: 14px;
+  row-gap: 4px;
 }
 
 .setting-row-top {
-  align-items: flex-start;
+  align-items: start;
 }
 
-.setting-row label {
-  min-width: 70px;
+.setting-row > label,
+.setting-row .slider-head > label {
+  grid-column: 1;
+  min-width: 0;
   font-size: 14px;
   font-weight: 500;
   opacity: 0.7;
-  flex-shrink: 0;
+  text-align: left;
+  line-height: 1.5;
+  /* 极长标签允许换行，但不要在任何位置硬断（中文标签不该被拆成两行）。 */
+  overflow-wrap: break-word;
+}
+
+/* 控件列：从第 2 列开始铺到行尾。 */
+.setting-row > .btn-group,
+.setting-row > .stepper,
+.setting-row > .font-picker,
+.setting-row > .voice-select,
+.setting-row > .opt-btn.wide,
+.setting-row > .image-picker-row,
+.setting-row > .inline-slider,
+.setting-row > .theme-swatches {
+  grid-column: 2 / -1;
+  min-width: 0;
+  justify-self: start;
+}
+
+/* 按钮组/步进器/色板按内容宽度排列，不要被拉伸成整行。 */
+.setting-row > .btn-group,
+.setting-row > .stepper,
+.setting-row > .theme-swatches {
+  justify-self: start;
+}
+
+/* 整行宽按钮（缓存/净化入口）才铺满控件列。 */
+.setting-row > .opt-btn.wide {
+  justify-self: stretch;
+}
+
+/* 下拉框铺满控件列，但绝不超出。 */
+.setting-row > .voice-select {
+  justify-self: stretch;
 }
 
 /* ─── 阅读配色 / 背景图 ─── */
@@ -2609,7 +2661,13 @@ onMounted(async () => {
 
 .voice-select {
   flex: 1;
+  /* 长音色名（「Microsoft Yunxi Online (Natural) - Chinese (Mainland)」）在
+     flex 项里会被 min-width:auto 顶到内容宽度，把设置面板顶出横向滚动条。
+     这三条一起才能兜住：允许收缩 / 不超出父容器 / 溢出用省略号。 */
   min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  text-overflow: ellipsis;
   padding: 10px 12px;
   border-radius: 12px;
   border: 1px solid var(--settings-field-border);
@@ -2777,22 +2835,32 @@ onMounted(async () => {
   border-radius: 20px;
   border: 1px solid rgba(0,0,0,0.12);
   overflow: hidden;
+  /* 段落行高/间距、朗读语速等都是「按内容的窄胶囊」。
+     .setting-row 是 flex 行，不写这两条时 stepper 会被拉伸成整行宽的空框
+     （表现就是「+ 按钮拉得老长」）。 */
+  flex: 0 0 auto;
+  width: fit-content;
 }
 
 /* Sliders
  *
- * 行结构是「.slider-head(标签 + 数值 + 可选回正按钮) + input[range]」。
- * 早先用 flex-column + space-between，滑块收窄到 240px 后数值会被顶到整行最右，
- * 和滑块之间空出一大截、看着像两个不相干的东西。
- * 这里改成 grid 并把整组居中：标签（定宽右对齐，保证各行左边界一致）/ 滑块 /
- * 数值 / 回正 排成一行，数值紧跟滑块右端，整体在面板里水平居中。
- * 用 display:contents 把 .slider-head 拆掉，避免改 11 处模板标记。 */
+ * 行结构是「.slider-head(标签 + 数值 + 可选回正按钮) + input[range]」，用 grid
+ * 排成一行：标签 / 滑块 / 数值 / 回正，整组居中。
+ * `display: contents` 把 .slider-head 拆掉，label、value、回正直接成为 grid item。
+ *
+ * **必须给每项写死 `grid-row: 1`**：grid 的自动放置是「稀疏」的 —— 按 DOM 顺序
+ * 排完 label(列1)、value(列3)、回正(列4) 后，光标已停在第 1 行末尾，此时再给
+ * 滑块指定 `grid-column: 2` 只会从光标后开始找，于是它被挤到**第 2 行**，
+ * 表现为「标签和数值一行、滑块单独一行」。写死行号后四项才真正同排。
+ */
 .slider-row {
   display: grid;
-  grid-template-columns: 96px minmax(120px, 240px) 56px 64px;
+  /* 第 1 列与 .setting-row 完全一致（104px）+ 同样的 14px 列间距，
+     滑块左端才能和上面的按钮组、下拉框严丝合缝地对齐。 */
+  grid-template-columns: 104px minmax(120px, 240px) 56px 64px;
   align-items: center;
-  justify-content: center;
-  column-gap: 10px;
+  justify-content: start;
+  column-gap: 14px;
   row-gap: 4px;
 }
 
@@ -2802,17 +2870,20 @@ onMounted(async () => {
 
 .slider-row .slider-head > label {
   grid-column: 1;
-  /* 右对齐：标签长短不一（「音调」/「缓冲字符数」）时滑块左端仍整齐。 */
-  text-align: right;
+  grid-row: 1;
+  /* 与普通行一致：左对齐，保证面板内只有一条文本竖线。 */
+  text-align: left;
 }
 
 .slider-row > .settings-slider {
   grid-column: 2;
+  grid-row: 1;
   width: 100%;
 }
 
 .slider-row .slider-head > .slider-value {
   grid-column: 3;
+  grid-row: 1;
   /* 定宽 + 右对齐：数值位数变化时滑块不会左右抖动。 */
   min-width: 52px;
   text-align: right;
@@ -2821,6 +2892,7 @@ onMounted(async () => {
 
 .slider-row .slider-head > .link-btn {
   grid-column: 4;
+  grid-row: 1;
   justify-self: start;
 }
 
@@ -2927,14 +2999,29 @@ onMounted(async () => {
     font-size: 12px;
   }
 
-  .setting-row {
-    align-items: center;
-    gap: 12px;
+  /* 窄屏：标签独占一行、控件整行铺开（88px + 控件在 360px 屏上太挤）。 */
+  .setting-row,
+  .slider-row {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 8px;
   }
 
-  .setting-row label {
-    min-width: 60px;
+  .setting-row > label,
+  .setting-row .slider-head > label {
+    grid-column: 1 / -1;
+    text-align: left;
     font-size: 13px;
+  }
+
+  .setting-row > .btn-group,
+  .setting-row > .stepper,
+  .setting-row > .font-picker,
+  .setting-row > .voice-select,
+  .setting-row > .opt-btn.wide,
+  .setting-row > .image-picker-row,
+  .setting-row > .inline-slider,
+  .setting-row > .theme-swatches {
+    grid-column: 1 / -1;
   }
 
   .btn-group {

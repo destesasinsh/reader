@@ -407,52 +407,14 @@
               </label>
             </div>
           </section>
-
-          <!-- 阅读增强：朗读引擎与净化规则都是**全局配置**，不该只能在阅读页里改。
-               这里以弹层复用阅读页那两个面板（standalone 模式），保证只有一份实现。 -->
-          <section v-show="activeSettingsTab === 'reader'" class="drawer-section">
-            <h3 class="section-title">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
-                <path d="M3 10v4a1 1 0 0 0 1 1h3l4 3V6L7 9H4a1 1 0 0 0-1 1z" />
-                <path d="M16 8a5 5 0 0 1 0 8" />
-                <path d="M19 5a9 9 0 0 1 0 14" />
-              </svg>
-              &#38405;&#35835;&#22686;&#24378;
-            </h3>
-            <div class="btn-group">
-              <button class="action-btn" @click="readerPanelOpen = 'speech'">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
-                  <path d="M12 3v18M8 7v10M4 10v4M16 7v10M20 10v4" />
-                </svg>
-                &#21548;&#20070;&#19982;&#26391;&#35835;&#35774;&#32622;
-              </button>
-              <button class="action-btn" @click="readerPanelOpen = 'rules'">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16">
-                  <path d="M4 6h16M4 12h10M4 18h7" />
-                </svg>
-                &#20869;&#23481;&#20928;&#21270;&#35268;&#21017;
-              </button>
-            </div>
-            <p class="drawer-hint">朗读引擎与净化规则都是全局配置，在这里设置后对所有书生效。</p>
-          </section>
         </div>
       </aside>
-    </Transition>
-
-    <!-- 独立模式的阅读面板：同一个组件，脱离阅读页也能改全局配置。 -->
-    <Transition name="fade">
-      <div v-if="modelValue && readerPanelOpen" class="reader-panel-overlay" @click.self="readerPanelOpen = null">
-        <div class="reader-panel-shell">
-          <ReadSettings v-if="readerPanelOpen === 'speech'" standalone @close="readerPanelOpen = null" />
-          <ReplaceRuleManager v-else standalone @close="readerPanelOpen = null" />
-        </div>
-      </div>
     </Transition>
   </Teleport>
 </template>
 
 <script setup lang="ts">
-import { computed, defineAsyncComponent, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAppStore } from '../stores/app'
 import { useBookshelfStore } from '../stores/bookshelf'
@@ -499,7 +461,6 @@ const recordingBossKey = ref(false)
 const allSettingsTabs = [
   { value: 'common', label: '常用' },
   { value: 'appearance', label: '外观' },
-  { value: 'reader', label: '阅读增强' },
   { value: 'app', label: '应用' },
 ] as const
 const settingsTabs = computed(() =>
@@ -513,23 +474,6 @@ const activeSettingsTab = ref<(typeof allSettingsTabs)[number]['value']>(
   appStore.isWebMode ? 'appearance' : 'common',
 )
 
-/**
- * 当前打开的独立阅读面板: `'speech'`(听书与朗读) / `'rules'`(内容净化) / null。
- *
- * 用异步组件按需加载: 这两个面板会带进整份阅读设置与净化规则管理逻辑, 而设置抽屉
- * 在首页就会挂载 —— 同步引入会让首屏白白多解析一大块。
- */
-const ReadSettings = defineAsyncComponent(() => import('./reader/ReadSettings.vue'))
-const ReplaceRuleManager = defineAsyncComponent(() => import('./reader/ReplaceRuleManager.vue'))
-const readerPanelOpen = ref<'speech' | 'rules' | null>(null)
-
-// 抽屉关闭时一并收起弹层，避免下次打开抽屉时残留上一次的面板。
-watch(
-  () => props.modelValue,
-  (open) => {
-    if (!open) readerPanelOpen.value = null
-  },
-)
 const proxyModeDraft = ref<'system' | 'manual'>(appStore.networkProxyMode)
 const proxyUrlDraft = ref(appStore.networkProxyUrl)
 const savingProxy = ref(false)
@@ -1481,44 +1425,6 @@ async function handleCheckVersionUpdate() {
 
 .theme-option:hover:not(.active) {
   border-color: var(--color-border);
-}
-
-/* ─── 独立阅读面板（朗读 / 净化规则） ─── */
-/* 弹层挂在 body 下: 抽屉自身是 overflow-y:auto 的侧栏, 内联面板会被裁剪。 */
-.reader-panel-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 1200;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 24px;
-  background: rgba(0, 0, 0, 0.42);
-}
-
-/* 尺寸与阅读页里的面板接近, 但给上限: 屏幕上它就是一张独立的大卡片。 */
-.reader-panel-shell {
-  width: min(760px, 100%);
-  height: min(88vh, 900px);
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-  border-radius: var(--radius-xl);
-  border: 1px solid var(--color-border-light);
-  box-shadow: var(--shadow-xl);
-  background: var(--color-bg-elevated);
-}
-
-/* 面板内部自带滚动（ReadSettings/.rule-manager 都是 height:100% + overflow-y:auto）。 */
-.reader-panel-shell > * {
-  min-height: 0;
-  flex: 1;
-}
-
-.drawer-hint {
-  margin: 4px 0 0;
-  font-size: var(--text-xs);
-  line-height: 1.5;
-  color: var(--color-text-tertiary);
+  color: var(--color-text-secondary);
 }
 </style>

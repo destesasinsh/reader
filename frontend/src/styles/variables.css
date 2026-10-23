@@ -141,7 +141,11 @@
   --z-sticky: 200;
   --z-overlay: 300;
   --z-modal: 400;
-  --z-toast: 500;
+  /* 嵌套弹层：主设置抽屉里再打开的独立面板（朗读设置 / 净化规则 / 引擎管理）。
+     它们的父级本身就是 overlay+modal，所以必须再高一层；但仍然低于 toast，
+     否则面板里的操作提示会被遮住。 */
+  --z-nested-overlay: 600;
+  --z-toast: 700;
 }
 
 /* ─── Dark Theme ─── */
