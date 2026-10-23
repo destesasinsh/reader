@@ -1079,15 +1079,16 @@ export const useReaderStore = defineStore('reader', () => {
    * 脚本规则只能在 Rust 沙盒里跑（渲染进程执行第三方脚本等于把 IPC 面交出去），
    * 所以这里先给出不含脚本的结果；`displayContent` 会在沙盒结果到达后替换成完整结果。
    * 纯正则/字面量规则不经过 IPC，保持原来的同步渲染速度。
+   *
+   * 失败原因写进 `failures` 而不是直接写 `failedReplaceRules`：这个函数会被
+   * `displayContent`（computed）调用，而 computed 里改 ref 会在求值期间触发渲染/重算，
+   * 并且会把沙盒那条路径刚写进去的原因冲掉。由调用方决定要不要落库。
    */
-  function applyReplaceRules(text: string) {
+  function applyReplaceRules(text: string, failures?: Record<string, string>) {
     if (!text) return ''
     let result = text
     const currentBook = book.value
     if (currentBook?.readConfig?.useReplaceRule === false) return text
-
-    // 每次执行都重算: 上一章的失败不该留到这一章, 也不该因为换书而残留。
-    failedReplaceRules.value = {}
 
     for (const rule of enabledReplaceRules.value) {
       if (isScriptRule(rule)) continue
@@ -1095,7 +1096,7 @@ export const useReaderStore = defineStore('reader', () => {
       if (compiled.kind === 'error') {
         // 收集而不是只 console.error：这些规则在导入时看起来是"成功"的, 但执行不了,
         // 必须让用户在规则管理里看到, 否则只会觉得"导入了却没效果"。
-        failedReplaceRules.value[rule.name] = compiled.error
+        if (failures) failures[rule.name] = compiled.error
         continue
       }
       if (compiled.kind === 'script') continue
@@ -1106,7 +1107,7 @@ export const useReaderStore = defineStore('reader', () => {
           result = result.replaceAll(compiled.needle, compiled.replacement)
         }
       } catch (e) {
-        failedReplaceRules.value[rule.name] = (e as Error).message
+        if (failures) failures[rule.name] = (e as Error).message
         console.error(`Failed to apply rule: ${rule.name}`, e)
       }
     }
@@ -1136,9 +1137,12 @@ export const useReaderStore = defineStore('reader', () => {
     // 本身, 因此原样返回。
     if (text.includes(PDF_PAGE_ATTR)) return text
     // 与手机端 ContentProcessor 一致: 先简繁转换, 再应用净化替换。
-    // 旧顺序会把替换结果再次交给词表, 例如「串行 → 序列」又被改回「串行」,
-    // 表现为替换规则怎么设都无效(issue #12 的另一半)。
-    return applyReplaceRules(convertContent(text))
+    // 旧顺序会把替换结果再次交给词表 (legado 词表方向相反, 例如「串行 → 序列」
+    // 又会被改回「串行」), 表现为替换规则怎么设都无效(issue #12 的另一半)。
+    const failures: Record<string, string> = {}
+    const output = applyReplaceRules(convertContent(text), failures)
+    failedReplaceRules.value = failures
+    return output
   }
 
   /** 简繁转换结果。沙盒路径与同步路径都以它为输入，保证两边处理的是同一段文本。 */
@@ -1151,6 +1155,13 @@ export const useReaderStore = defineStore('reader', () => {
    * 规则或翻页后还会显示旧结果。
    */
   const sandboxedContent = ref<{ source: string; rulesKey: string; text: string } | null>(null)
+  /**
+   * 沙盒失败时记下「输入 + 规则集」，让 `displayContent` 知道当前正文是降级结果。
+   *
+   * 失败时正文会回落到不含脚本的同步结果 —— 那和「脚本本来就跑过了」在界面上完全
+   * 一样，必须能区分，否则用户只会觉得规则没生效。
+   */
+  const sandboxFailureKey = ref<string | null>(null)
   let sandboxToken = 0
 
   function replaceRulesKey(rules: ReplaceRule[]) {
@@ -1168,16 +1179,21 @@ export const useReaderStore = defineStore('reader', () => {
       const scriptRules = rules.filter(isScriptRule)
       if (!scriptRules.length || book.value?.readConfig?.useReplaceRule === false) {
         sandboxedContent.value = null
+        sandboxFailureKey.value = null
         return
       }
 
       const rulesKey = replaceRulesKey(rules)
+      const currentKey = `${source}\u0002${rulesKey}`
       if (
         sandboxedContent.value?.source === source &&
         sandboxedContent.value.rulesKey === rulesKey
       ) {
         return
       }
+
+      // 每轮重算: 上一章/上一套规则的失败不该留到这一章。
+      failedReplaceRules.value = {}
 
       const steps: SandboxReplaceRuleStep[] = []
       for (const rule of rules) {
@@ -1192,16 +1208,17 @@ export const useReaderStore = defineStore('reader', () => {
       const token = ++sandboxToken
       try {
         const text = await applyReplaceRulesInSandbox({ text: source, rules: steps })
-        if (token === sandboxToken) {
-          sandboxedContent.value = { source, rulesKey, text }
-        }
+        if (token !== sandboxToken) return
+        sandboxedContent.value = { source, rulesKey, text }
+        sandboxFailureKey.value = null
       } catch (error) {
-        if (token === sandboxToken) {
-          sandboxedContent.value = null
-          // 整批失败时无法定位到具体哪条规则，把原因挂到脚本规则名下，让规则管理里能看见。
-          for (const rule of scriptRules) {
-            failedReplaceRules.value[rule.name] = (error as Error).message
-          }
+        if (token !== sandboxToken) return
+        sandboxedContent.value = null
+        sandboxFailureKey.value = currentKey
+        // 整批失败时无法定位到具体哪条规则，把原因挂到脚本规则名下，让规则管理里能看见。
+        const message = (error as Error).message
+        for (const rule of scriptRules) {
+          failedReplaceRules.value[rule.name] = message
         }
       }
     },
@@ -1218,7 +1235,15 @@ export const useReaderStore = defineStore('reader', () => {
       return cached.text
     }
     // 沙盒结果还没到：先显示同步结果（脚本规则暂不生效），到达后自动刷新。
+    // 注意这里不能改动任何 ref —— computed 求值期间写入会触发递归更新。
     return applyReplaceRules(source)
+  })
+
+  /** 当前正文是否是「脚本规则没跑成」的降级结果（给正文顶部提示用）。 */
+  const replaceRulesDegraded = computed(() => {
+    const rules = enabledReplaceRules.value
+    if (!rules.some(isScriptRule)) return false
+    return sandboxFailureKey.value === `${convertedContent.value}\u0002${replaceRulesKey(rules)}`
   })
 
   // 两个档位都要加载转换器: 「简体」档现在也要真的做繁→简(此前它什么都不做)。
@@ -4117,7 +4142,7 @@ export const useReaderStore = defineStore('reader', () => {
     isSpeechPreviewing, isSpeechPreviewLoading, previewSpeech, stopSpeechPreview,
     attachSpeechStreamControls, synthesizeSpeechChunkBlob,
     setOpenAISpeechSource, setSpeechApiFormat, setOpenAISpeechBaseUrl, setSpeechProxyUrl, setOpenAISpeechApiKey, setOpenAISpeechModel, setOpenAISpeechVoice, setOpenAISpeechFormat, setOpenAISpeechRequestMode, preloadOpenAITTS,
-    displayContent, processContentForDisplay,
+    displayContent, processContentForDisplay, replaceRulesDegraded,
     isAutoScrolling,
     readerControlsVisible,
     hotkeyBindings, hotkeyActions, hotkeysAreDefault, setHotkeyBinding, resetHotkeyBindings,

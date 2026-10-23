@@ -2,9 +2,17 @@ import { describe, expect, it } from 'vitest'
 import {
   compileReplaceRule,
   convertJavaRegexToJs,
+  findUnsupportedSyntax,
   toJsReplacement,
   toSandboxRuleStep,
 } from './replaceRuleRegex'
+
+/** 转换结果里的正则源；无法降级时直接让测试失败。 */
+function sourceOf(pattern: string): string {
+  const converted = convertJavaRegexToJs(pattern)
+  expect(converted.error, `${pattern} 不应被判为无法降级：${converted.error}`).toBeNull()
+  return converted.source
+}
 
 describe('convertJavaRegexToJs', () => {
   it('把开头的内联旗标提成 flags', () => {
@@ -29,7 +37,7 @@ describe('convertJavaRegexToJs', () => {
   })
 
   it('\\h 展开成水平空白字符类', () => {
-    const { source } = convertJavaRegexToJs('a\\hb')
+    const source = sourceOf('a\\hb')
     expect(source).not.toContain('\\h')
     expect(source).toContain('\\t')
     // 能匹配普通空格与全角空格
@@ -38,33 +46,59 @@ describe('convertJavaRegexToJs', () => {
     expect(re.test('a\u3000b')).toBe(true)
   })
 
+  it('\\h 写在字符类里也只展开成范围（不能变成 [[...]]）', () => {
+    const source = sourceOf('[\\h]+')
+    // `[[ ... ]]` 会编译成功但永远匹配不到空白 —— 这是最容易漏的静默错误
+    const re = new RegExp(source)
+    expect(re.test(' ')).toBe(true)
+    expect(re.test('\u3000')).toBe(true)
+    expect(re.test('a')).toBe(false)
+  })
+
   it('占有量词退化成贪婪量词（JS 没有占有量词）', () => {
-    expect(convertJavaRegexToJs('a++').source).toBe('a+')
-    expect(convertJavaRegexToJs('a*+').source).toBe('a*')
-    expect(convertJavaRegexToJs('a{2,3}+').source).toBe('a{2,3}')
+    expect(sourceOf('a++')).toBe('a+')
+    expect(sourceOf('a*+')).toBe('a*')
+    expect(sourceOf('a{2,3}+')).toBe('a{2,3}')
   })
 
   it('\\R 展开成任意换行', () => {
-    const { source } = convertJavaRegexToJs('a\\Rb')
-    const re = new RegExp(source)
+    const re = new RegExp(sourceOf('a\\Rb'))
     expect(re.test('a\nb')).toBe(true)
     expect(re.test('a\r\nb')).toBe(true)
   })
 
   it('作用域内旗标 (?i:...) 保持原样', () => {
-    const { source } = convertJavaRegexToJs('(?i:abc)')
-    expect(source).toBe('(?i:abc)')
+    expect(sourceOf('(?i:abc)')).toBe('(?i:abc)')
+  })
+})
+
+describe('findUnsupportedSyntax', () => {
+  it('拦下 JS 会静默当成字面量的 Java 写法', () => {
+    // 这几种在 JS 里都能编译，只是永远匹配不到 —— 比报错更难发现
+    for (const pattern of ['\\p{L}+', '\\Qab\\E', '\\Gabc', '(?>a)', '\\H', '\\z']) {
+      expect(findUnsupportedSyntax(pattern), `${pattern} 应被拦下`).toBeTruthy()
+    }
+  })
+
+  it('可降级的写法不误伤', () => {
+    for (const pattern of ['\\h', '\\w+', 'a++', '\\R', '(?i)x']) {
+      expect(findUnsupportedSyntax(pattern), `${pattern} 不应被拦下`).toBeNull()
+    }
   })
 })
 
 describe('toJsReplacement', () => {
   it('$0 转成 $&（Java 的整个匹配）', () => {
     expect(toJsReplacement('[$0]')).toBe('[$&]')
+    // 光看字符串不够：`$&` 只有在 String.replace 的替换串里才表示整个匹配
+    expect('aXa'.replace(/X/g, toJsReplacement('[$0]'))).toBe('a[X]a')
   })
 
   it('不误伤 $1..$9 与 $&', () => {
     expect(toJsReplacement('$1-$2')).toBe('$1-$2')
     expect(toJsReplacement('$&')).toBe('$&')
+    expect(toJsReplacement('$10')).toBe('$10')
+    expect('ab'.replace(/(a)(b)/g, toJsReplacement('$1-$2'))).toBe('a-b')
   })
 })
 
@@ -114,6 +148,20 @@ describe('compileReplaceRule', () => {
 
   it('无法降级的写法如实报错，而不是假装成功', () => {
     const compiled = compileReplaceRule('(?P<name>x)', true, '')
+    expect(compiled.kind).toBe('error')
+  })
+
+  it('JS 能编译但语义不同的 Java 写法也判成无法执行', () => {
+    // 这几种 `new RegExp` 不抛异常，只能靠显式扫描；否则用户只会看到"规则没效果"
+    for (const pattern of ['\\p{L}+', '\\Qab\\E', '\\Gabc', '(?>a)']) {
+      const compiled = compileReplaceRule(pattern, true, '')
+      expect(compiled.kind, `${pattern} 应判成无法执行`).toBe('error')
+      if (compiled.kind === 'error') expect(compiled.error).toBeTruthy()
+    }
+  })
+
+  it('脚本规则的正则部分无法降级时也不能送沙盒', () => {
+    const compiled = compileReplaceRule('\\p{L}+', true, '@js:result')
     expect(compiled.kind).toBe('error')
   })
 })

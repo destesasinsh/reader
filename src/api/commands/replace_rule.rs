@@ -173,13 +173,20 @@ pub async fn apply_replace_rules_core(
         )));
     }
 
-    // 脚本是用户从网上导入的，可能写出死循环。放到阻塞线程池里执行并设上限，
-    // 最坏情况只损失一个后台线程和这一章的净化结果，不会拖住整个 IPC 运行时而卡死界面。
+    // 脚本是用户从网上导入的，可能写出死循环。两层保护缺一不可：
+    // 1. 沙盒内部的 interrupt handler（`apply_rules_with_timeout`）真正打断执行，
+    //    超时返回时线程已经停下，不会留下还在烧 CPU 的后台线程；
+    // 2. 这里的 `timeout` 是兜底：万一 interrupt handler 没能生效（比如卡在
+    //    Rust 侧的分配/拷贝），至少不会把 IPC 运行时拖住。
     let handle = tokio::task::spawn_blocking(move || {
-        crate::parser::replace_rule_js::apply_rules(&text, &rules)
+        crate::parser::replace_rule_js::apply_rules_with_timeout(
+            &text,
+            &rules,
+            REPLACE_SCRIPT_TIMEOUT,
+        )
     });
 
-    match tokio::time::timeout(REPLACE_SCRIPT_TIMEOUT, handle).await {
+    match tokio::time::timeout(REPLACE_SCRIPT_TIMEOUT + INTERRUPT_GRACE, handle).await {
         Ok(Ok(Ok(output))) => Ok(ApiResponse::ok(output)),
         Ok(Ok(Err(message))) => Err(AppError::BadRequest(message)),
         Ok(Err(join_error)) => Err(AppError::BadRequest(format!(
@@ -195,7 +202,11 @@ pub async fn apply_replace_rules_core(
 const MAX_REPLACE_SCRIPT_RULES: usize = 500;
 
 /// 单章脚本执行上限。正常整章处理在毫秒级，超过这个量级基本可以判定是死循环。
-const REPLACE_SCRIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+const REPLACE_SCRIPT_TIMEOUT: std::time::Duration = crate::parser::replace_rule_js::DEFAULT_SCRIPT_TIMEOUT;
+
+/// 外层 timeout 的宽限：内层 interrupt 到期后还要走完 unwind 与错误文案构造，
+/// 外层若卡在同一时刻会偶发抢先报"超时"、丢掉内层更准确的原因。
+const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// `apply_replace_rules` 的 Tauri 入口: 只是 core 的薄壳。
 #[tauri::command]

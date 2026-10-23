@@ -72,7 +72,7 @@ reader-rust 是「阅读3.0」的 Rust 实现，主形态是 **Tauri v2 桌面�
 - **`ring` 的 C 编译会随机失败**：报 `cl.exe ... D8050: cannot execute c1.dll: failed to get command line into debug records`。同样是杀软竞态，但表现不同 —— 它发生在 `ring` 的 C 源码（`crypto/curve25519/curve25519.c`）编译阶段，重启一次通常就好。想让它稳定可复现，构建时加 `CARGO_PROFILE_DEV_DEBUG=0` 关掉调试信息（debug 构建不需要逐行调试依赖）。
 - **本机 `%TEMP%` 可能被组策略/沙箱挡住写入**：`std::env::temp_dir()` 下的 `create_dir_all` 会返回 `PermissionDenied (os error 5)`，于是所有用临时目录的测试（`app::window_state`、`export::epub`、`service::book_group_service`、`service::http_tts_service` 等约 48 个）集体失败。**这不是代码 bug**。绕开办法是把 `TEMP`/`TMP` 指到工作区内可写目录再跑测试：
   ```powershell
-  $env:TEMP='D:\Dev\Reader\.cargo-tmp'; $env:TMP=$env:TEMP
+  $env:TEMP="$PWD\.cargo-tmp"; $env:TMP=$env:TEMP
   New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
   cargo test -p reader-rust --lib -j 2
   ```

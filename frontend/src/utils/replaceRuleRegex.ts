@@ -13,13 +13,43 @@
  * - **占有量词** `++` / `*+` / `?+` / `{n,m}+`：JS 不支持，退化成贪婪匹配。
  * - **`\R`**：Java 的任意换行，展开成 `(?:\r\n|[\r\n])`。
  *
- * 刻意**不**处理的东西（没有可靠等价物，宁可让编译器报错、由 UI 标成「无法执行」，
- * 也不静默改变语义）：`\p{...}`（需要 u 旗标，而 u 会让 `\-` 之类旧写法变语法错误）、
- * 原子组 `(?>...)`、`\G`。
+ * 刻意**不**支持的东西（没有可靠等价物）：`\p{...}`（需要 u 旗标，而 u 会让 `\-`
+ * 之类旧写法变语法错误）、原子组 `(?>...)`、`\G`、`\Q...\E`。
+ *
+ * 这类写法**必须在 [`findUnsupportedSyntax`] 里显式拦下来**。原因：JS 的 `RegExp`
+ * 对它们大多不报错，而是把 `\p{L}` 当字面量 `p{L}`、把 `\G` 当 `G` —— 编译"成功"
+ * 但永远匹配不到正文，用户只会看到「规则导入了却没效果」。宁可判成「无法执行」。
  */
 
-/** Java 专有、但可以安全展开成等价字符类的写法。 */
-const HORIZONTAL_SPACE = '[ \\t\\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000]'
+/** Java 的水平空白，展开成字符类**内容**（不带外层方括号，由调用方按上下文补）。 */
+const HORIZONTAL_SPACE = ' \\t\\u00a0\\u1680\\u2000-\\u200a\\u202f\\u205f\\u3000'
+
+/**
+ * Java 专有、JS 里没有可靠等价物、必须判成「无法执行」的写法。
+ *
+ * 这些在 JS 里**不会**抛异常（`\p{L}` 会被当成字面量 `p{L}`、`\G` 当成 `G`、
+ * `\Q..\E` 当成字面量 `Q..E`），编译"成功"但永远匹配不到正文，所以只能自己扫。
+ */
+const UNSUPPORTED_SYNTAX: Array<{ probe: RegExp; message: string }> = [
+  { probe: /\\[pP]\{/, message: '不支持 \\p{...} / \\P{...}（Unicode 属性，JS 无等价写法）' },
+  { probe: /\(\?>/, message: '不支持原子组 (?>...)' },
+  { probe: /\\G/, message: '不支持 \\G（上次匹配结束位置锚点）' },
+  { probe: /\\Q|\\E/, message: '不支持 \\Q...\\E（字面量引用段）' },
+  { probe: /\\H/, message: '不支持 \\H（水平空白补集，JS 无等价写法）' },
+  { probe: /\\[zZ]/, message: '不支持 \\z / \\Z（JS 无等价写法，可用 $ 替代）' },
+]
+
+/**
+ * 扫出无法降级的 Java 语法；返回 `null` 表示可以降级。
+ *
+ * 必须在**替换之前**扫原始 pattern：`\h` 变成字符类之后原文就不在了。
+ */
+export function findUnsupportedSyntax(pattern: string): string | null {
+  for (const { probe, message } of UNSUPPORTED_SYNTAX) {
+    if (probe.test(pattern)) return message
+  }
+  return null
+}
 
 /** 内联旗标组 `(?i)`、`(?ms)`。带冒号的 `(?i:...)` 是作用域内旗标，不动它。 */
 const INLINE_FLAGS = /\(\?([imsx]+)\)/g
@@ -74,16 +104,26 @@ const UNICODE_NON_WORD = [
   '\\uFF5B-\\uFFFF',
 ].join('')
 
-/** 把 `\w` / `\W` 展开成 Unicode 字符类；字符类内部只展开成范围（不能嵌套方括号）。 */
-function expandUnicodeWord(pattern: string): string {
+/**
+ * 把 `\w` / `\W` / `\h` 展开成 Unicode 字符类。
+ *
+ * `\h` 必须走这里而不是字符串替换：Java 允许把 `\h` 写在字符类里（`[\h]+`），
+ * 而 `HORIZONTAL_SPACE` 自带范围分隔符，直接拼会变成 `[[ ... ]]` —— 一个「包含
+ * 方括号的字符类」，能编译但永远匹配不到空白。
+ */
+function expandShorthandClasses(pattern: string): string {
   let output = ''
   let inClass = false
   for (let index = 0; index < pattern.length; index += 1) {
     const char = pattern[index]
     if (char === '\\') {
       const next = pattern[index + 1]
-      if (next === 'w' || next === 'W') {
-        const body = next === 'w' ? UNICODE_WORD : UNICODE_NON_WORD
+      if (next === 'w' || next === 'W' || next === 'h') {
+        const body = next === 'w'
+          ? UNICODE_WORD
+          : next === 'W'
+            ? UNICODE_NON_WORD
+            : HORIZONTAL_SPACE
         output += inClass ? body : `[${body}]`
         index += 1
         continue
@@ -126,11 +166,12 @@ export function compileReplaceRule(
   // 桌面版在 Rust 沙盒里执行（见 src/parser/replace_rule_js.rs），这里只负责把
   // 正则部分降级成 JS 语法，脚本原文保持不动。
   if (/^@js:/i.test(replacement.trim())) {
-    const { source, flags } = convertJavaRegexToJs(pattern)
+    const converted = convertJavaRegexToJs(pattern)
+    if (converted.error) return { kind: 'error', error: converted.error }
     return {
       kind: 'script',
-      source,
-      flags,
+      source: converted.source,
+      flags: converted.flags,
       code: replacement.trim().slice('@js:'.length),
     }
   }
@@ -147,11 +188,12 @@ export function compileReplaceRule(
     }
   }
 
-  const { source, flags } = convertJavaRegexToJs(pattern)
+  const converted = convertJavaRegexToJs(pattern)
+  if (converted.error) return { kind: 'error', error: converted.error }
   try {
     return {
       kind: 'regex',
-      regex: new RegExp(source, flags),
+      regex: new RegExp(converted.source, converted.flags),
       replacement: toJsReplacement(replacement),
     }
   } catch (error) {
@@ -163,7 +205,18 @@ export function compileReplaceRule(
 }
 
 /** 拆出 Java 正则里的内联旗标并做语法降级。导出以便单测直接断言转换结果。 */
-export function convertJavaRegexToJs(pattern: string): { source: string; flags: string } {
+export interface ConvertedJavaRegex {
+  source: string
+  flags: string
+  /** 无法降级时为中文原因；此时 `source` 不可用，调用方必须当成「无法执行」。 */
+  error: string | null
+}
+
+export function convertJavaRegexToJs(pattern: string): ConvertedJavaRegex {
+  // 先在原文上扫不支持的语法：`\h` 等替换之后原文就没了。
+  const unsupported = findUnsupportedSyntax(pattern)
+  if (unsupported) return { source: pattern, flags: 'gm', error: unsupported }
+
   let flags = 'gm'
   let source = pattern.replace(INLINE_FLAGS, (_match, letters: string) => {
     for (const letter of letters) {
@@ -173,12 +226,11 @@ export function convertJavaRegexToJs(pattern: string): { source: string; flags: 
     return ''
   })
 
-  source = source.replaceAll('\\h', HORIZONTAL_SPACE)
   source = source.replace(POSSESSIVE_QUANTIFIER, '$1')
   source = source.replaceAll('\\R', '(?:\\r\\n|[\\r\\n])')
-  source = expandUnicodeWord(source)
+  source = expandShorthandClasses(source)
 
-  return { source, flags }
+  return { source, flags, error: null }
 }
 
 /**
@@ -218,17 +270,18 @@ export function toSandboxRuleStep(
   replacement: string,
 ): SandboxStepResult {
   if (/^@js:/i.test(replacement.trim())) {
-    const { source, flags } = convertJavaRegexToJs(pattern)
+    const converted = convertJavaRegexToJs(pattern)
+    if (converted.error) return { ok: false, error: converted.error }
     try {
-      new RegExp(source, flags)
+      new RegExp(converted.source, converted.flags)
     } catch (error) {
       return { ok: false, error: (error as Error).message }
     }
     return {
       ok: true,
       step: {
-        pattern: source,
-        flags,
+        pattern: converted.source,
+        flags: converted.flags,
         replacement: replacement.trim().slice('@js:'.length),
         isScript: true,
       },
@@ -248,14 +301,20 @@ export function toSandboxRuleStep(
     }
   }
 
-  const { source, flags } = convertJavaRegexToJs(pattern)
+  const converted = convertJavaRegexToJs(pattern)
+  if (converted.error) return { ok: false, error: converted.error }
   try {
-    new RegExp(source, flags)
+    new RegExp(converted.source, converted.flags)
   } catch (error) {
     return { ok: false, error: (error as Error).message }
   }
   return {
     ok: true,
-    step: { pattern: source, flags, replacement: toJsReplacement(replacement), isScript: false },
+    step: {
+      pattern: converted.source,
+      flags: converted.flags,
+      replacement: toJsReplacement(replacement),
+      isScript: false,
+    },
   }
 }

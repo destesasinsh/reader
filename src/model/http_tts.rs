@@ -21,9 +21,15 @@ pub struct HttpTts {
     /// 请求头（JSON 对象文本）。值里可以含 `{{...}}` 模板。
     #[serde(deserialize_with = "deserialize_string_option")]
     pub header: Option<String>,
-    /// Legado 的并发/间隔限制，朗读场景用不到，但保留以便原样回写。
+    /// Legado 的并发率（`次数/毫秒` 或 `毫秒` 间隔）。朗读时的实际限速见
+    /// `service::http_tts_throttle`；导入/回写都原样保留。
     #[serde(deserialize_with = "deserialize_string_option")]
     pub concurrent_rate: Option<String>,
+    /// Legado 的合成并发线程数（1–8）。缺省/0/负数表示「引擎没声明」——此时不限
+    /// 并发（本应用的前端缓冲流自己控制在 2 个），只有写了具体数字才生效，见
+    /// `service::http_tts_throttle::concurrency_limit`。
+    #[serde(deserialize_with = "deserialize_i64_option")]
+    pub synthesis_thread_count: Option<i64>,
     #[serde(deserialize_with = "deserialize_string_option")]
     pub content_type: Option<String>,
     #[serde(deserialize_with = "deserialize_bool_option")]
@@ -189,6 +195,7 @@ mod tests {
             "name",
             "url",
             "concurrentRate",
+            "synthesisThreadCount",
             "contentType",
             "enabledCookieJar",
             "header",

@@ -7,15 +7,13 @@
 //!
 //! 协议参考：本机安装的 `edge_tts` 7.3.1（`communicate.py` / `constants.py`）。
 
-use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::{client::ClientRequestBuilder, Message};
 
-use crate::error::error::AppError;
-use crate::service::edge_tts_drm;
+use crate::error::error::AppError;use crate::service::edge_tts_drm;
 
 const BASE_URL: &str = "speech.platform.bing.com/consumer/speech/synthesize/readaloud";
 const TRUSTED_CLIENT_TOKEN: &str = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
@@ -340,25 +338,17 @@ pub fn parse_voice_list(payload: &[u8]) -> Result<Vec<Value>, AppError> {
     Ok(voices)
 }
 
-/// 进程内音色缓存：成功拉取一次后复用，失败不缓存（下次请求会重试）。
+/// 进程内音色缓存：成功后缓存一天（见 `service::voice_cache`），失败不缓存。
 ///
-/// 放在 service 内部而不是 AppState：AppState 的构造在 `app/bootstrap.rs`，
-/// 本任务写范围不包含那个文件；语义上仍是「进程内 Mutex，成功才缓存」。
-static VOICE_CACHE: OnceLock<Mutex<Option<Vec<Value>>>> = OnceLock::new();
-
-fn voice_cache() -> &'static Mutex<Option<Vec<Value>>> {
-    VOICE_CACHE.get_or_init(|| Mutex::new(None))
-}
+/// 早先只缓存不设期限 —— 服务端加了新音色，用户必须重启才看得到。
+static VOICE_CACHE: crate::service::voice_cache::VoiceCache =
+    crate::service::voice_cache::VoiceCache::new();
 
 /// 拉取音色列表（带进程内缓存）。`client` 由命令层传入（复用应用的 HTTP 代理配置）。
 pub async fn list_voices(
     client: &reqwest::Client,
 ) -> Result<Vec<Value>, AppError> {
-    if let Some(cached) = voice_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
-    {
+    if let Some(cached) = VOICE_CACHE.fresh() {
         return Ok(cached);
     }
 
@@ -390,6 +380,11 @@ pub async fn list_voices(
 
     let status = response.status();
     if !status.is_success() {
+        // 刷新失败：退回旧列表（可能只是临时断网/被限流），旧音色照样能用。
+        if let Some(stale) = VOICE_CACHE.any() {
+            tracing::warn!("刷新 Edge 音色列表失败（{status}），继续使用缓存");
+            return Ok(stale);
+        }
         return Err(http_status_error("获取音色列表", status));
     }
     let bytes = response
@@ -398,13 +393,114 @@ pub async fn list_voices(
         .map_err(|error| http_transport_error("读取音色列表", &error))?;
     let voices = parse_voice_list(&bytes)?;
 
-    *voice_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(voices.clone());
+    VOICE_CACHE.store(voices.clone());
     Ok(voices)
 }
 
 // ───────────────────────────── 合成 ─────────────────────────────
+
+/// 建立 WebSocket 连接（可经 HTTP 代理）。
+///
+/// `tokio_tungstenite::connect_async` 内部用的是裸 `TcpStream::connect`，完全绕过
+/// 应用配置的代理 —— 结果是「音色列表能拉（走 reqwest）、合成必失败（走直连）」。
+/// 这里自己建 TCP：有代理时先发 CONNECT 建立隧道，再把手里的流交给
+/// `client_async_tls_with_config` 完成 TLS 与 WebSocket 握手。
+async fn connect_websocket(
+    request: ClientRequestBuilder,
+    endpoint: (String, u16),
+    proxy: Option<&str>,
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    tokio_tungstenite::tungstenite::Error,
+> {
+    use tokio::io::AsyncWriteExt;
+    use tokio_tungstenite::tungstenite::Error as WsError;
+
+    // `ClientRequestBuilder` 不暴露 uri 读取接口，所以 host/port 由调用方传进来
+    // （那里刚从同一份 url 解析过）。
+    let (host, port) = endpoint;
+
+    let Some(proxy) = proxy.map(str::trim).filter(|value| !value.is_empty()) else {
+        let stream = tokio::net::TcpStream::connect((host.as_str(), port))
+            .await
+            .map_err(WsError::Io)?;
+        return tokio_tungstenite::client_async_tls_with_config(request, stream, None, None).await;
+    };
+
+    // 代理只支持 http:// 形式（设置页限制如此）。解析失败时报错，不静默退回直连 ——
+    // 用户配了代理却悄悄直连，会让"代理是否生效"变得无法判断。
+    let proxy_url = url::Url::parse(proxy).map_err(|_| {
+        WsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("代理地址无效: {proxy}"),
+        ))
+    })?;
+    let proxy_host = proxy_url.host_str().unwrap_or_default().to_string();
+    if proxy_host.is_empty() {
+        return Err(WsError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "代理地址缺少主机名",
+        )));
+    }
+    let proxy_port = proxy_url.port_or_known_default().unwrap_or(8080);
+    let mut stream = tokio::net::TcpStream::connect((proxy_host.as_str(), proxy_port))
+        .await
+        .map_err(WsError::Io)?;
+
+    // HTTP CONNECT 建隧道。注意 `Host` 里要带端口，否则部分代理会连到 80。
+    let authority = format!("{host}:{port}");
+    let connect_request = format!(
+        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n\r\n"
+    );
+    stream
+        .write_all(connect_request.as_bytes())
+        .await
+        .map_err(WsError::Io)?;
+
+    // 只读到响应头结束：之后的字节属于 TLS 握手，多读一个字节都会破坏它。
+    let mut response = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
+    loop {
+        use tokio::io::AsyncReadExt;
+        let read = stream.read(&mut byte).await.map_err(WsError::Io)?;
+        if read == 0 {
+            return Err(WsError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "代理在 CONNECT 阶段断开",
+            )));
+        }
+        response.push(byte[0]);
+        if response.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if response.len() > 8 * 1024 {
+            return Err(WsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "代理返回的响应头过长",
+            )));
+        }
+    }
+    let head = String::from_utf8_lossy(&response);
+    let status_ok = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .map(|code| code == "200")
+        .unwrap_or(false);
+    if !status_ok {
+        return Err(WsError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            format!("代理拒绝了 CONNECT 请求: {}", head.lines().next().unwrap_or_default()),
+        )));
+    }
+
+    tokio_tungstenite::client_async_tls_with_config(request, stream, None, None).await
+}
 
 /// 用 Edge 朗读合成一段文本，返回 mp3 字节。
 ///
@@ -414,6 +510,7 @@ pub async fn list_voices(
 ///
 /// `output_format` 是调用方请求的音质；非法值在内部回退 48k（见
 /// [`normalize_output_format`]），不会因为音质参数让朗读失败。
+/// `proxy` 是应用设置里的 HTTP 代理（`None` 表示直连），见 [`connect_websocket`]。
 pub async fn synthesize(
     text: &str,
     voice: &str,
@@ -421,6 +518,7 @@ pub async fn synthesize(
     pitch: &str,
     volume: &str,
     output_format: &str,
+    proxy: Option<&str>,
 ) -> Result<Vec<u8>, AppError> {
     let text = text.trim();
     if text.is_empty() {
@@ -445,6 +543,13 @@ pub async fn synthesize(
     let uri = url
         .parse::<http::Uri>()
         .map_err(|_| channel_unavailable("服务地址无效"))?;
+    let host = uri
+        .host()
+        .ok_or_else(|| channel_unavailable("服务地址缺少主机名"))?
+        .to_string();
+    let port = uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("wss") { 443 } else { 80 });
     let builder = ClientRequestBuilder::new(uri)
         .with_header("User-Agent", USER_AGENT)
         .with_header("Origin", ORIGIN)
@@ -459,7 +564,7 @@ pub async fn synthesize(
     let ssml_frame = build_ssml_frame(&connection_id(), &timestamp, &ssml);
 
     let audio = tokio::time::timeout(REQUEST_TIMEOUT, async move {
-        let (mut socket, _response) = tokio_tungstenite::connect_async(builder)
+        let (mut socket, _response) = connect_websocket(builder, (host, port), proxy.as_deref())
             .await
             .map_err(websocket_error)?;
         socket
@@ -803,6 +908,7 @@ mod tests {
                 "+0Hz",
                 "+0%",
                 OUTPUT_FORMAT_48K,
+                None,
             )
             .await
             .unwrap_err();
@@ -824,6 +930,7 @@ mod tests {
             "+0Hz",
             "+0%",
             OUTPUT_FORMAT_48K,
+            None,
         )
         .await
         .unwrap_err();
@@ -853,6 +960,7 @@ mod tests {
                 "+0Hz",
                 "+0%",
                 output_format,
+                None,
             )
             .await
             .expect("synthesize")
@@ -891,6 +999,7 @@ mod tests {
             "+0Hz",
             "+0%",
             OUTPUT_FORMAT_48K,
+            None,
         )
         .await
         .unwrap_err();

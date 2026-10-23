@@ -63,20 +63,28 @@ impl MsDemoTtsRequest {
             style_degree: ms_demo_tts::normalize_style_degree(
                 self.style_degree.unwrap_or(1.0),
             ),
-            role: normalize_param(self.role, "default"),
-            rate: normalize_param(self.rate, "+0%"),
-            pitch: normalize_param(self.pitch, "+0%"),
-            volume: normalize_param(self.volume, "+0%"),
+            // role 是枚举名（`default` / `YoungAdultFemale` …），不是偏移量，
+            // 只做 trim 与空值兜底。
+            role: self
+                .role
+                .map(|role| role.trim().to_string())
+                .filter(|role| !role.is_empty())
+                .unwrap_or_else(|| "default".to_string()),
+            // 这个通道的三个参数都是百分比（pitch 也是，与 Edge 的 Hz 不同）。
+            rate: crate::service::tts_param::normalize_offset(self.rate.as_deref(), "+0%", &["%"]),
+            pitch: crate::service::tts_param::normalize_offset(
+                self.pitch.as_deref(),
+                "+0%",
+                &["%"],
+            ),
+            volume: crate::service::tts_param::normalize_offset(
+                self.volume.as_deref(),
+                "+0%",
+                &["%"],
+            ),
             output_format: ms_demo_tts::normalize_output_format(self.format.as_deref()),
         })
     }
-}
-
-fn normalize_param(value: Option<String>, default: &str) -> String {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| default.to_string())
 }
 
 /// 列出微软朗读音色的共享实现（进程内缓存，第一次成功拉取后复用）。

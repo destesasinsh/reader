@@ -116,8 +116,10 @@
             >
           </div>
           <div class="import-hint">
-            支持 Legado 净化规则的 JSON 数组格式。pattern 或 replacement 以
-            <code>@js:</code> 开头的脚本规则暂不支持，导入时会自动跳过并统计。
+            支持 Legado 净化规则的 JSON 数组格式。<code>replacement</code> 以
+            <code>@js:</code> 开头的脚本规则会在 Rust 沙盒里执行；
+            <code>pattern</code> 本身是脚本（用脚本生成匹配式）的规则没有等价能力，
+            导入时会跳过并统计。
           </div>
           <div class="import-actions">
             <button class="op-btn" :disabled="importing" @click="importFromUrl">
@@ -193,9 +195,16 @@ const sortedRules = computed(() => {
   return [...store.replaceRules].sort((a, b) => a.order - b.order)
 })
 
-/** 规则名 → 无法执行的原因。直接按规则本身编译判断, 不依赖"是否正在阅读"。 */
+/**
+ * 规则名 → 无法执行的原因。
+ *
+ * 两个来源缺一不可：
+ *  - 静态编译：规则本身写错（正则不支持、脚本语法错），一进列表就该标出来；
+ *  - 运行时失败：`store.failedReplaceRules` 记录本次阅读里真正执行失败的规则
+ *    （超时、脚本抛错、内存超限）。只做静态检查的话，「点了没反应」无从排查。
+ */
 const ruleIssues = computed(() => {
-  const issues = new Map<string, string>()
+  const issues = new Map<string, string>(Object.entries(store.failedReplaceRules))
   for (const rule of store.replaceRules) {
     const compiled = compileReplaceRule(rule.pattern, rule.isRegex, rule.replacement)
     if (compiled.kind === 'error') issues.set(rule.name, compiled.error)

@@ -320,13 +320,24 @@ fn escape_ssml_attribute(value: &str) -> String {
     value.replace('&', "&amp;").replace('"', "&quot;").replace('\'', "&apos;")
 }
 
-/// 正文清洗：先删 `/` 与 `\` 再 XML 转义。
+/// 正文清洗：只做 XML 转义，**不改动正文内容**。
 ///
-/// 删这两个字符是照抄插件原实现：演示接口在这两个字符出现在正文时偶发返回
-/// 空音频（可能是 SSML 解析器把它们当路径/转义处理），删掉后稳定。
+/// 旧实现会把 `/` 与 `\` 直接删掉（照抄插件原实现：这两个字符偶尔让演示接口返回
+/// 空音频）。代价是「1/2」「A\B」、URL、代码片段在朗读里被读错且不可恢复 —— 为了
+/// 一个偶发问题牺牲所有正文不值得。
+///
+/// 折中办法：正常情况按原文朗读；**只有真的收到空音频**时才换成
+/// [`neutralize_slash_like`] 的变体重试一次（见 [`synthesize`]）。
 pub fn sanitize_tts_text(text: &str) -> String {
-    let filtered: String = text.chars().filter(|ch| *ch != '/' && *ch != '\\').collect();
-    escape_ssml(&filtered)
+    escape_ssml(text)
+}
+
+/// 空音频兜底：把 `/`、`\` 换成外形相近的全角字符再重试。
+///
+/// 用替换而不是删除：`1/2` 至少还是「1／2」，读出来仍能听懂；直接删会变成 `12`，
+/// 语义完全变了。
+fn neutralize_slash_like(text: &str) -> String {
+    text.replace('/', "／").replace('\\', "＼")
 }
 
 /// 语音的 locale：`zh-CN-YunjianNeural` → `zh-CN`。
@@ -452,19 +463,12 @@ pub fn parse_voice_list(payload: &[u8]) -> Result<Vec<Value>, AppError> {
     Ok(voices)
 }
 
-static VOICE_CACHE: OnceLock<Mutex<Option<Vec<Value>>>> = OnceLock::new();
+static VOICE_CACHE: crate::service::voice_cache::VoiceCache =
+    crate::service::voice_cache::VoiceCache::new();
 
-fn voice_cache() -> &'static Mutex<Option<Vec<Value>>> {
-    VOICE_CACHE.get_or_init(|| Mutex::new(None))
-}
-
-/// 音色列表（进程内缓存，成功才缓存）。
+/// 音色列表（进程内缓存一天，失败不缓存；刷新失败时退回旧列表）。
 pub async fn list_voices(client: &reqwest::Client) -> Result<Vec<Value>, AppError> {
-    if let Some(cached) = voice_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
-    {
+    if let Some(cached) = VOICE_CACHE.fresh() {
         return Ok(cached);
     }
 
@@ -475,11 +479,20 @@ pub async fn list_voices(client: &reqwest::Client) -> Result<Vec<Value>, AppErro
         endpoint = endpoint_for_request(client).await?;
         response = get_voice_list(client, &endpoint).await?;
         if should_refresh_token(response.status()) {
+            if let Some(stale) = VOICE_CACHE.any() {
+                tracing::warn!("刷新微软朗读音色列表的 token 失败，继续使用缓存");
+                return Ok(stale);
+            }
             return Err(http_status_error("获取音色列表", response.status()));
         }
     }
     let status = response.status();
     if !status.is_success() {
+        // 刷新失败：退回旧列表（可能只是临时断网/被限流），旧音色照样能用。
+        if let Some(stale) = VOICE_CACHE.any() {
+            tracing::warn!("刷新微软朗读音色列表失败（{status}），继续使用缓存");
+            return Ok(stale);
+        }
         return Err(http_status_error("获取音色列表", status));
     }
     let bytes = response
@@ -488,9 +501,7 @@ pub async fn list_voices(client: &reqwest::Client) -> Result<Vec<Value>, AppErro
         .map_err(|error| http_transport_error("读取音色列表", &error))?;
     let voices = parse_voice_list(&bytes)?;
 
-    *voice_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(voices.clone());
+    VOICE_CACHE.store(voices.clone());
     Ok(voices)
 }
 
@@ -578,6 +589,34 @@ pub async fn synthesize(
         .bytes()
         .await
         .map_err(|error| http_transport_error("读取合成音频", &error))?;
+
+    // 空音频兜底：正文里带 `/` / `\` 时演示接口偶发返回空响应（旧实现直接删字符，
+    // 代价是「1/2」被读成「12」）。这里只在真的拿到空音频时才换成全角字符重试一次，
+    // 正常文本完全不受影响。
+    if bytes.is_empty() && text.contains(['/', '\\']) {
+        let retry_ssml = build_ssml(
+            params.voice,
+            params.style,
+            params.style_degree,
+            params.role,
+            params.rate,
+            params.pitch,
+            params.volume,
+            &neutralize_slash_like(text),
+        );
+        let retry = post_synthesis(client, &endpoint, output_format, &retry_ssml).await?;
+        if retry.status().is_success() {
+            let retry_bytes = retry
+                .bytes()
+                .await
+                .map_err(|error| http_transport_error("读取合成音频", &error))?;
+            if !retry_bytes.is_empty() && looks_like_audio(&retry_bytes) {
+                return Ok(retry_bytes.to_vec());
+            }
+        }
+        return Err(unavailable("没有返回音频数据"));
+    }
+
     if bytes.is_empty() {
         return Err(unavailable("没有返回音频数据"));
     }
@@ -747,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn ssml_escapes_text_and_strips_slashes() {
+    fn ssml_escapes_text_without_dropping_characters() {
         let ssml = build_ssml(
             "zh-CN-YunjianNeural",
             "",
@@ -758,9 +797,19 @@ mod tests {
             "+0%",
             r#"甲<&乙 3/4 C:\tmp "q" 's'"#,
         );
-        // `/`、`\` 被删；& < > " ' 被转义。
-        assert!(ssml.contains("甲&lt;&amp;乙 34 C:tmp &quot;q&quot; &apos;s&apos;"));
-        assert!(!ssml.contains("3/4"));
+        // 只转义，不删字符：`/`、`\` 必须原样留在正文里（旧实现会把「3/4」读成「34」）。
+        assert!(ssml.contains("甲&lt;&amp;乙 3/4 C:\\tmp &quot;q&quot; &apos;s&apos;"));
+        assert!(ssml.contains("3/4"), "斜杠不能被删：{ssml}");
+        assert!(ssml.contains("C:\\tmp"), "反斜杠不能被删：{ssml}");
+    }
+
+    /// 空音频兜底把斜杠换成全角，而不是删掉 —— 「1/2」读成「1／2」还能听懂。
+    #[test]
+    fn slash_fallback_replaces_instead_of_deleting() {
+        assert_eq!(neutralize_slash_like("3/4"), "3／4");
+        assert_eq!(neutralize_slash_like(r"C:\tmp"), "C:＼tmp");
+        // 不含斜杠的文本不受影响
+        assert_eq!(neutralize_slash_like("普通正文"), "普通正文");
     }
 
     #[test]

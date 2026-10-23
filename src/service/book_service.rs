@@ -689,6 +689,15 @@ impl BookService {
         self.http.client()
     }
 
+    /// 当前生效的 HTTP 代理地址（形如 `http://host:port`）。
+    ///
+    /// 给不走 `reqwest` 的通道用：Edge 朗读是 WebSocket，连接由 tungstenite 自己建，
+    /// 拿不到 `reqwest::Client` 上的代理配置，必须显式把地址传下去，否则「设置里配了
+    /// 代理」的用户会出现「音色能列、合成必失败」。
+    pub fn active_proxy(&self) -> Option<String> {
+        self.http.active_proxy()
+    }
+
     /// Return a client isolated to one book source. Its cookie jar is never
     /// shared with another source or with the app's generic HTTP client.
     pub async fn source_http_client(

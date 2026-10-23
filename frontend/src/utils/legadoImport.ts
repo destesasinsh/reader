@@ -9,10 +9,11 @@
  */
 
 import { invokeEnvelope } from '../api/invoke'
-import { readRemoteSourceFile, saveBookSources } from '../api/source'
-import { readRemoteRssSourceFile, saveRssSources } from '../api/rss'
-import { saveReplaceRules } from '../api/replaceRule'
-import { readRemoteHttpTtsFile, saveHttpTtsList } from '../api/httpTts'
+import { getBookSources, readRemoteSourceFile, saveBookSources } from '../api/source'
+import { getRssSources, readRemoteRssSourceFile, saveRssSources } from '../api/rss'
+import { saveReplaceRules, getReplaceRules } from '../api/replaceRule'
+import { readRemoteHttpTtsFile, saveHttpTtsList, getHttpTtsList } from '../api/httpTts'
+import { useAppStore } from '../stores/app'
 import {
   buildReplaceRuleImportMessage,
   normalizeLegadoReplaceRules,
@@ -42,18 +43,57 @@ function flattenJsonTexts(texts: string[]): unknown[] {
   })
 }
 
+/**
+ * 导入前的确认。
+ *
+ * 为什么要确认：`legado://` 是注册到系统的协议，**任何网页**都能放一条链接把用户
+ * 引到这里；而保存是按 URL upsert 的，同 URL 的已有条目会被静默覆盖。不给用户看
+ * 一眼「要导入什么、多少条、可能覆盖多少条」就落盘，等于把一次点击变成不可撤销的
+ * 数据变更。
+ */
+async function confirmImport(
+  kindName: string,
+  incoming: number,
+  overwriting: number,
+): Promise<boolean> {
+  const appStore = useAppStore()
+  const detail = overwriting > 0
+    ? `\n其中 ${overwriting} 条与现有条目同地址，继续会覆盖它们的配置。`
+    : ''
+  return appStore.confirmDialog(
+    `即将导入 ${incoming} 条${kindName}。${detail}\n来源：外部链接（legado://）`,
+    { title: '确认导入' },
+  )
+}
+
 async function importBookSources(src: string): Promise<LegadoImportResult> {
   const texts = await readRemoteSourceFile(src)
   const sources = flattenJsonTexts(texts) as BookSource[]
   if (!sources.length) throw new Error('链接里的书源文件为空或格式不正确')
-  await saveBookSources(sources)
-  return { message: `已导入 ${sources.length} 个书源`, type: 'success' }
+
+  const existing = new Set((await getBookSources()).map((source) => source.bookSourceUrl))
+  const overwriting = sources.filter((source) => existing.has(source.bookSourceUrl)).length
+  if (!(await confirmImport('书源', sources.length, overwriting))) {
+    throw new Error('已取消导入')
+  }
+
+  const saved = await saveBookSources(sources)
+  // 后端是"尽力写入"：它返回实际落盘条数，而不是我们送进去的条数。
+  const count = saved?.count ?? sources.length
+  return { message: `已导入 ${count} 个书源`, type: count < sources.length ? 'warning' : 'success' }
 }
 
 async function importRssSources(src: string): Promise<LegadoImportResult> {
   const texts = await readRemoteRssSourceFile(src)
   const sources = flattenJsonTexts(texts) as RssSource[]
   if (!sources.length) throw new Error('链接里的订阅源文件为空或格式不正确')
+
+  const existing = new Set((await getRssSources()).map((source) => source.sourceUrl))
+  const overwriting = sources.filter((source) => existing.has(source.sourceUrl)).length
+  if (!(await confirmImport('订阅源', sources.length, overwriting))) {
+    throw new Error('已取消导入')
+  }
+
   await saveRssSources(sources)
   return { message: `已导入 ${sources.length} 个订阅源`, type: 'success' }
 }
@@ -67,15 +107,30 @@ async function importReplaceRules(src: string): Promise<LegadoImportResult> {
     // 全被跳过时不写库，直接按错误抛出，让用户看到具体原因而不是"导入 0 条"。
     throw new Error(built.text)
   }
+  // 规则按 name upsert，同名会被覆盖；这里也算一下会覆盖多少条。
+  const existing = new Set((await getReplaceRules()).map((rule) => rule.name))
+  const overwriting = result.rules.filter((rule) => existing.has(rule.name)).length
+  if (!(await confirmImport('净化规则', result.rules.length, overwriting))) {
+    throw new Error('已取消导入')
+  }
   await saveReplaceRules(result.rules)
   return { message: built.text, type: built.type === 'success' ? 'success' : 'warning' }
 }
 
 async function importHttpTts(src: string): Promise<LegadoImportResult> {
   const texts = await readRemoteHttpTtsFile(src)
-  const drafts = flattenJsonTexts(texts) as Parameters<typeof saveHttpTtsList>[0]
-  const engines = Array.isArray(drafts) ? drafts : drafts.data
-  if (!engines.length) throw new Error('链接里的朗读引擎文件为空或格式不正确')
+  // `flattenJsonTexts` 已经摊平成数组，不再有 `{ data }` 信封要拆。
+  const engines = flattenJsonTexts(texts) as Parameters<typeof saveHttpTtsList>[0]
+  if (!Array.isArray(engines) || !engines.length) {
+    throw new Error('链接里的朗读引擎文件为空或格式不正确')
+  }
+  const existing = new Set((await getHttpTtsList()).map((engine) => engine.name))
+  const overwriting = engines.filter(
+    (engine) => Boolean(engine.name) && existing.has(engine.name as string),
+  ).length
+  if (!(await confirmImport('朗读引擎', engines.length, overwriting))) {
+    throw new Error('已取消导入')
+  }
   const saved = await saveHttpTtsList(engines)
   const skipped = saved?.skipped ?? 0
   return {

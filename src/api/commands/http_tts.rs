@@ -100,28 +100,24 @@ pub async fn delete_http_tts(
 
 /// 从直链拉取朗读引擎集合的共享实现。返回形态与 `read_remote_source_file` 一致：
 /// `vec[0]` 是整份 `HttpTts[]` 的 JSON 文本，前端 `JSON.parse` 后即可展示/保存。
+///
+/// 下载走 `api::remote_text`：与净化规则的远程导入共用同一份"边读边计数"的上限
+/// 逻辑。这里以前是 `.text()` 一把梭 —— 分块响应能直接把内存吃干。
 pub async fn read_remote_http_tts_file_core(
     state: &AppState,
     req: RemoteHttpTtsParam,
 ) -> Result<ApiResponse<Vec<String>>, AppError> {
-    let url = req.url.trim();
-    if url.is_empty() {
+    if req.url.trim().is_empty() {
         return Err(AppError::BadRequest(
             "请输入朗读引擎文件的地址".to_string(),
         ));
     }
-    let client = state.book_service.http_client();
-    let text = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| {
-            tracing::error!("Failed to fetch remote http tts from {url}: {error:?}");
-            AppError::BadRequest(format!("网络请求失败: {error}"))
-        })?
-        .text()
-        .await
-        .map_err(|error| AppError::BadRequest(format!("读取响应失败: {error}")))?;
+    let text = crate::api::remote_text::fetch_capped_text(
+        &state.book_service.http_client(),
+        &req.url,
+        crate::api::remote_text::MAX_REMOTE_TEXT_BYTES,
+    )
+    .await?;
 
     let payload: Value =
         serde_json::from_str(&text).map_err(|_| invalid_http_tts_json())?;
@@ -198,6 +194,34 @@ async fn synthesize_segment_bytes(
     let method = reqwest::Method::from_bytes(rendered.method.as_bytes()).map_err(|_| {
         AppError::BadRequest(format!("不支持的朗读引擎请求方法: {}", rendered.method))
     })?;
+
+    // 尊重引擎自己的 concurrentRate（Legado 的 AnalyzeUrl 同样走 ConcurrentRateLimiter）。
+    // 缓冲流默认 2 并发，双音色时是两个引擎交替；不少在线引擎明确写了间隔，
+    // 不加限速就是对第三方网关违约，轻则 429、重则封 IP。
+    let rate = crate::service::http_tts_throttle::parse_concurrent_rate(
+        tts.concurrent_rate.as_deref(),
+    );
+    if let Some(rate) = rate {
+        let throttle_key = format!("httpTts:{}", tts.id);
+        // 循环而不是只等一轮：等待期间可能有别的请求把新窗口又占满。
+        while let Some(wait) =
+            crate::service::http_tts_throttle::acquire(&throttle_key, rate)
+        {
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    // 再按引擎声明的 synthesisThreadCount 限并发。**先取并发许可再发请求**，且
+    // 许可必须活到函数结束：它代表"这个引擎此刻有一条在飞"，提前 drop 就等于没限。
+    // 与上面的限速是两道独立的闸 —— 写了间隔又写了线程数的引擎两个都要过。
+    let slot_key = format!("httpTtsSlot:{}", tts.id);
+    let _slot = match crate::service::http_tts_throttle::concurrency_limit(
+        tts.synthesis_thread_count,
+    ) {
+        Some(limit) => crate::service::http_tts_throttle::acquire_slot(&slot_key, limit).await,
+        None => None,
+    };
+
     let mut outgoing = client
         .request(method, &rendered.url)
         .timeout(Duration::from_secs(120));
@@ -341,7 +365,10 @@ fn extract_tts_payload(payload: Value) -> Result<Vec<Value>, AppError> {
 }
 
 fn invalid_http_tts_json() -> AppError {
-    AppError::BadRequest("invalid http tts json format".to_string())
+    // 文案会直接显示在中文界面上（toast / 导入结果），不要留英文。
+    AppError::BadRequest(
+        "朗读引擎文件格式不正确：应为 JSON 数组，或含 data 数组的对象".to_string(),
+    )
 }
 
 fn value_to_i64(value: &Value) -> Option<i64> {

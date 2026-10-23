@@ -51,19 +51,21 @@ impl EdgeTtsSynthesizeRequest {
         Ok(NormalizedEdgeTtsRequest {
             text,
             voice,
-            rate: normalize_param(self.rate, "+0%"),
-            pitch: normalize_param(self.pitch, "+0Hz"),
-            volume: normalize_param(self.volume, "+0%"),
+            // pitch 用 `Hz`，rate/volume 用 `%` —— 单位由通道决定，不能互串。
+            rate: crate::service::tts_param::normalize_offset(self.rate.as_deref(), "+0%", &["%"]),
+            pitch: crate::service::tts_param::normalize_offset(
+                self.pitch.as_deref(),
+                "+0Hz",
+                &["Hz"],
+            ),
+            volume: crate::service::tts_param::normalize_offset(
+                self.volume.as_deref(),
+                "+0%",
+                &["%"],
+            ),
             output_format: edge_tts::normalize_output_format(self.format.as_deref()),
         })
     }
-}
-
-fn normalize_param(value: Option<String>, default: &str) -> String {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| default.to_string())
 }
 
 /// 列出 Edge 朗读音色的共享实现（进程内缓存，第一次成功拉取后复用）。
@@ -84,12 +86,15 @@ pub async fn edge_tts_list_voices(
 
 /// 合成一段 Edge 朗读音频的共享实现（mp3 字节，前端 `invokeRaw` 取 ArrayBuffer）。
 ///
-/// 不需要 `&AppState`：整条链路只依赖请求参数与 service 内部的 WebSocket，
-/// 不碰书名/书源等应用状态。
+/// 合成本身只依赖请求参数，但**代理必须来自 `AppState`**：WebSocket 由
+/// tungstenite 自己建 TCP，拿不到 `reqwest::Client` 上的代理配置；不显式传下去，
+/// 「设置里配了代理」的用户会看到「音色能列、合成必失败」。
 pub async fn edge_tts_synthesize_core(
+    state: &AppState,
     req: EdgeTtsSynthesizeRequest,
 ) -> Result<tauri::ipc::Response, AppError> {
     let request = req.normalize()?;
+    let proxy = state.book_service.active_proxy();
     let audio = edge_tts::synthesize(
         &request.text,
         &request.voice,
@@ -97,6 +102,7 @@ pub async fn edge_tts_synthesize_core(
         &request.pitch,
         &request.volume,
         request.output_format,
+        proxy.as_deref(),
     )
     .await?;
     Ok(tauri::ipc::Response::new(audio))
@@ -105,9 +111,10 @@ pub async fn edge_tts_synthesize_core(
 /// `edge_tts_synthesize` 的 Tauri 入口: 只是 core 的薄壳。
 #[tauri::command]
 pub async fn edge_tts_synthesize(
+    state: tauri::State<'_, AppState>,
     req: EdgeTtsSynthesizeRequest,
 ) -> Result<tauri::ipc::Response, AppError> {
-    edge_tts_synthesize_core(req).await
+    edge_tts_synthesize_core(&state, req).await
 }
 
 #[cfg(test)]

@@ -238,6 +238,9 @@ export interface HttpTts {
   contentType?: string | null
   header?: string | null
   concurrentRate?: string | null
+  /** Legado 的合成并发线程数（1–8）。缺省/0 表示不限并发（本应用的前端缓冲流
+   *  自己控制在 2 个），只有引擎明确写了数字时后端才按它限流。 */
+  synthesisThreadCount?: number | null
   enabledCookieJar?: boolean | null
   loginUrl?: string | null
   loginUi?: string | null

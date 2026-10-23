@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod deep_link;
 pub mod protocol;
+pub mod remote_text;
 
 use crate::app::config::AppConfig;
 use tauri::ipc::Invoke;
